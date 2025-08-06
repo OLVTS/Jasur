@@ -1,1 +1,1 @@
-worker: channeltest.py
+worker: python channeltest.py
