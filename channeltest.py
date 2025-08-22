@@ -2994,15 +2994,16 @@ def main():
     )
     app.add_handler(myads_conv)
 
-    app.job_queue.run_repeating(
-        auto_repost_job,
-        interval=timedelta(days=1),
-        first=timedelta(minutes=30),
-        name="auto_repost",
-    )
+    # app.job_queue.run_repeating(
+    #     auto_repost_job,
+    #     interval=timedelta(days=1),
+    #     first=timedelta(minutes=30),
+    #     name="auto_repost",
+    # )
 
     app.run_polling()
 
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
