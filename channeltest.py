@@ -776,7 +776,7 @@ async def myads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 raise
 
         # сначала удаляем в канале
-        ok = await delete_object_in_channel(context.bot, code)
+        ok = await delete_object_in_channel(context.bot, code, deactivate=True, use_saved_ids=True)
 
         if ok:
             # затем помечаем запись в БД как inactive
@@ -1251,7 +1251,7 @@ async def repost_object_in_channel(
                 conn.commit()
 
     # 4) Пробуем удалить старый пост, но игнорируем ошибки
-    await delete_object_in_channel(bot, code, deactivate=False, use_saved_ids=False)
+    await delete_object_in_channel(bot, code, deactivate=False, use_saved_ids=True)
 
     # 5) Переименовываем поля для build_caption
     ptype_map = {
@@ -3006,4 +3006,5 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
 
