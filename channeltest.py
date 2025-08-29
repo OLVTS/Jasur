@@ -317,19 +317,19 @@ async def delete_object_in_channel(
     code: str,
     *,
     deactivate: bool = True,
-    use_saved_ids: bool = False,
+    use_saved_ids: bool = True,
 ) -> bool:
     """
     Удаляет пост-альбом по object_code:
-      1) по сохранённым message_ids (если use_saved_ids=True),
-      2) иначе — ищет «Код объекта: <code>» и удаляет весь альбом,
-      3) если что-то удалено и deactivate=True — помечает запись inactive.
+      1) берёт message_ids из БД и удаляет каждое;
+      2) если message_ids пусты/битые — логирует причину;
+      3) при успехе (удалилось ≥1) и deactivate=True — помечает запись inactive.
     """
-    # 1) читаем message_ids и функцию mark_inactive
     conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    rec_data = None
-    inactive_fn = None
+    cur  = conn.cursor()
+
+    rec_table = None
+    msg_json  = None
     for tbl, mark_fn in (
         ("old_fund",   mark_inactive_old_fund),
         ("new_fund",   mark_inactive_new_fund),
@@ -338,34 +338,46 @@ async def delete_object_in_channel(
     ):
         cur.execute(f"SELECT message_ids FROM {tbl} WHERE object_code = ?", (code,))
         row = cur.fetchone()
-        if row and row[0]:
-            rec_data, inactive_fn = row[0], mark_fn
+        if row is not None:
+            rec_table = tbl
+            msg_json  = row[0]
+            inactive_fn = mark_fn
             break
     conn.close()
 
+    if not rec_table:
+        logger.warning("delete_object_in_channel: object %s not found in any table", code)
+        return False
+
     deleted_any = False
 
-    # 2) удаляем по сохранённым ID, если запрошено
-    if use_saved_ids and rec_data:
+    if use_saved_ids:
         try:
-            msg_ids = json.loads(rec_data)
-            for mid in msg_ids:
+            ids = json.loads(msg_json) if msg_json else []
+            if not isinstance(ids, list):
+                logger.error("message_ids for %s is not a list: %r", code, msg_json)
+                ids = []
+        except Exception as e:
+            logger.error("Bad JSON message_ids for %s: %s", code, e)
+            ids = []
+
+        if not ids:
+            logger.warning("No message_ids stored for %s — nothing to delete", code)
+        else:
+            for mid in ids:
                 try:
-                    await bot.delete_message(CHANNEL_ID, mid)
+                    await bot.delete_message(CHANNEL_ID, int(mid))
                     deleted_any = True
                 except Exception as e:
-                    logger.warning("Не смог удалить %s: %s", mid, e)
-        except Exception as e:
-            logger.error("Плохой JSON message_ids для %s: %s", code, e)
+                    logger.warning("Failed to delete %s for %s: %s", mid, code, e)
 
-
-    # 4) если что-то удалилось и нужно — помечаем запись inactive
-    if deleted_any and deactivate and inactive_fn:
-        # чтобы снять потенциальный read-lock SQLite
+    if deleted_any and deactivate:
+        # Снимаем потенциальный read-lock SQLite
         await asyncio.sleep(0)
         inactive_fn(code)
 
     return deleted_any
+
 
 
 # ── helpers: price utils ───────────────────────────────────────────
@@ -1164,7 +1176,7 @@ async def repost_object_in_channel(
     # 2) Обычный репост: не чаще 3 дней
     if new_price is None and rec.get("repost_date"):
         last  = datetime.fromisoformat(rec["repost_date"])
-        delta = datetime.now() - last
+        delta = datetime.utcnow() - last
         limit = timedelta(days=1) if rec.get("old_price") else timedelta(days=3)
         if delta < limit:
             if user_id:
@@ -2389,7 +2401,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_client_secondary_request(uid, obj):
         await update.message.reply_text(
             "По этому объекту вы уже оставляли заявку.\n"
-            "Вернитесь в (канал)[https://t.me/pravdainedvijimost] и выберите другой объект.\n\n"
+            "Вернитесь в [канал](https://t.me/pravdainedvijimost) и выберите другой объект.\n\n"
             "Если с вами не связались, обратитесь по номеру: +998938013204",
             parse_mode="Markdown"
         )
@@ -3006,5 +3018,6 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
 
 
