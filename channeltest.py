@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 from telegram.ext.filters import StatusUpdate
 from db import (
-    DB_FILE, set_dsn,
+    set_dsn,
     init_db,
     insert_into_old_fund,
     insert_into_new_fund,
@@ -40,9 +40,16 @@ from db import (
     search_land,
     search_commerce,
     drop_price_old_fund, drop_price_new_fund, drop_price_land, drop_price_commerce,
-    insert_client_secondary, get_last_client_secondary, get_client_base, upsert_client_base, next_object_code
+    insert_client_secondary, get_last_client_secondary, get_client_base, upsert_client_base, next_object_code,
+    list_active_by_realtor,
+    exists_active_object_code,
+    list_active_objects_for_repost,
+    update_message_ids_and_repost_date,
+    update_channel_message_and_repost_date,
+    clear_old_price,
+    client_secondary_exists,
 )
-import asyncio, json, logging, re, sqlite3
+import asyncio, json, logging, re
 
 from refresh import refresh_file_ids
 
@@ -321,65 +328,48 @@ async def delete_object_in_channel(
     deactivate: bool = True,
     use_saved_ids: bool = True,
 ) -> bool:
-    """
-    Удаляет пост-альбом по object_code:
-      1) берёт message_ids из БД и удаляет каждое;
-      2) если message_ids пусты/битые — логирует причину;
-      3) при успехе (удалилось ≥1) и deactivate=True — помечает запись inactive.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-
-    rec_table = None
-    msg_json  = None
-    for tbl, mark_fn in (
-        ("old_fund",   mark_inactive_old_fund),
-        ("new_fund",   mark_inactive_new_fund),
-        ("land",       mark_inactive_land),
-        ("commerce",   mark_inactive_commerce),
+    # найдём запись через search_* (без sqlite3)
+    rec = None
+    inactive_fn = None
+    for tbl, search_fn, mark_fn in (
+        ("old_fund", search_old_fund, mark_inactive_old_fund),
+        ("new_fund", search_new_fund, mark_inactive_new_fund),
+        ("land",     search_land,     mark_inactive_land),
+        ("commerce", search_commerce, mark_inactive_commerce),
     ):
-        cur.execute(f"SELECT message_ids FROM {tbl} WHERE object_code = ?", (code,))
-        row = cur.fetchone()
-        if row is not None:
-            rec_table = tbl
-            msg_json  = row[0]
+        r = search_fn(code)
+        if r:
+            rec = r
             inactive_fn = mark_fn
             break
-    conn.close()
-
-    if not rec_table:
-        logger.warning("delete_object_in_channel: object %s not found in any table", code)
+    if not rec:
+        logger.warning("delete_object_in_channel: object %s not found", code)
         return False
 
     deleted_any = False
-
     if use_saved_ids:
         try:
-            ids = json.loads(msg_json) if msg_json else []
-            if not isinstance(ids, list):
-                logger.error("message_ids for %s is not a list: %r", code, msg_json)
-                ids = []
-        except Exception as e:
-            logger.error("Bad JSON message_ids for %s: %s", code, e)
+            ids = rec.get("message_ids") or []
+            if isinstance(ids, str):
+                ids = json.loads(ids)
+        except Exception:
             ids = []
 
-        if not ids:
-            logger.warning("No message_ids stored for %s — nothing to delete", code)
-        else:
-            for mid in ids:
-                try:
-                    await bot.delete_message(CHANNEL_ID, int(mid))
-                    deleted_any = True
-                except Exception as e:
-                    logger.warning("Failed to delete %s for %s: %s", mid, code, e)
+        for mid in ids:
+            try:
+                await bot.delete_message(CHANNEL_ID, int(mid))
+                deleted_any = True
+            except Exception as e:
+                logger.warning("Failed to delete %s for %s: %s", mid, code, e)
 
-    if deleted_any and deactivate:
-        # Снимаем потенциальный read-lock SQLite
-        await asyncio.sleep(0)
+    if deleted_any and deactivate and inactive_fn:
         inactive_fn(code)
-
     return deleted_any
 
+
+MAX_CAP = 1024
+def _cap(c: str) -> str:
+    return c if len(c) <= MAX_CAP else (c[:1000].rstrip() + "…")
 
 
 # ── helpers: price utils ───────────────────────────────────────────
@@ -399,31 +389,15 @@ def _price_to_int(price: str) -> int:
     return int(re.sub(r"\D", "", price))
 
 async def _current_price(code: str) -> tuple[int, str] | None:
-    """
-    Возвращает (int_value, pretty) актуальной цены
-    из realty.db, игнорируя зачёркнутые старые.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-
-    for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(
-            f"SELECT price, initial_price FROM {tbl} WHERE object_code = ? AND status = 'active'",
-            (code,)
-        )
-        row = cur.fetchone()
-        if row and row[0]:
-            price_str = row[0]  # например "123 000 у.е."
-            digits    = re.sub(r"\D", "", price_str)
+    for search_fn in (search_old_fund, search_new_fund, search_land, search_commerce):
+        rec = search_fn(code)
+        if rec and (rec.get("status") == "active") and rec.get("price"):
+            price_str = rec["price"]
+            digits = re.sub(r"\D", "", price_str)
             try:
-                val = int(digits)
+                return int(digits), price_str
             except ValueError:
-                conn.close()
                 return None
-            conn.close()
-            return val, price_str
-
-    conn.close()
     return None
 
 MYADS_FIELDS = [
@@ -668,63 +642,28 @@ async def send_myads_page(
 
 async def myads_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Показывает пользователю его активные объявления из базы данных постранично.
-    Теперь realtor_code = Telegram-ID пользователя → никаких users_data.json не нужно.
+    Показывает пользователю его активные объявления (Postgres).
+    realtor_code = Telegram-ID пользователя.
     """
-    # 1) Только в личке
     if update.effective_chat.type != "private":
-        await update.message.reply_text(
-            "❗ Команда /myads работает только в личных сообщениях."
-        )
+        await update.message.reply_text("❗ Команда /myads работает только в личных сообщениях.")
         return ConversationHandler.END
 
-    # 2) Telegram-ID текущего пользователя = realtor_code в БД
     realtor = str(update.effective_user.id)
 
-    # 3) Берём все активные объекты этого риелтора из четырёх таблиц
-    conn    = sqlite3.connect(DB_FILE)
-    cur     = conn.cursor()
+    # берём активные из всех таблиц
     records = []
-
-    for table in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(
-            f"SELECT * FROM {table} WHERE realtor_code = ? AND status = 'active'",
-            (realtor,)
-        )
-        cols = [c[0] for c in cur.description]
-
-        for row in cur.fetchall():
-            rec = dict(zip(cols, row))
-
-            # ---- десериализация фото / видео ------------------------
-            for key in ("photos", "videos"):
-                raw = rec.get(key)
-                if isinstance(raw, str):
-                    try:
-                        rec[key] = json.loads(raw)
-                    except json.JSONDecodeError:
-                        rec[key] = []
-                elif not isinstance(raw, list):
-                    rec[key] = []
-
-            # ---- ptype + order_type для build_caption ---------------
-            rec["ptype"] = {
-                "old_fund": "Старыйфонд",
-                "new_fund": "Новыйфонд",
-                "land":     "Участок",
-                "commerce": "Коммерция",
-            }[table]
-            rec["order_type"] = str(rec.get("order_type", ""))
-
-            records.append((table, rec))
-
-    conn.close()
+    for table, rec in list_active_by_realtor(realtor):
+        # проставим ptype и строковый order_type для build_* дальше
+        rec["ptype"] = TABLE_PTYPE[table]
+        rec["order_type"] = str(rec.get("order_type", "") or "")
+        records.append((table, rec))
 
     if not records:
         await update.message.reply_text("У вас нет активных объявлений.")
         return ConversationHandler.END
 
-    # 4) Убираем старые элементы управления
+    # убрать старые контролы
     chat_id = update.effective_chat.id
     del_tasks = [
         context.bot.delete_message(chat_id, c["mid"])
@@ -734,7 +673,7 @@ async def myads_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await asyncio.gather(*del_tasks, return_exceptions=True)
     context.user_data["myads_controls"] = []
 
-    # 5) Сохраняем список объектов в user_data и показываем первую страницу
+    # сохранить и показать страницу
     context.user_data["myads_records"] = records
     context.user_data["myads_page"]    = 0
     await send_myads_page(context, chat_id, 0)
@@ -792,22 +731,6 @@ async def myads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # сначала удаляем в канале
         ok = await delete_object_in_channel(context.bot, code, deactivate=True, use_saved_ids=True)
 
-        if ok:
-            # затем помечаем запись в БД как inactive
-            conn = sqlite3.connect(DB_FILE)
-            cur  = conn.cursor()
-            table = next(
-                (tbl for tbl, rec in data.get("myads_records", [])
-                 if str(rec.get("object_code")) == code),
-                None
-            )
-            if table:
-                cur.execute(
-                    f"UPDATE {table} SET status = 'inactive' WHERE object_code = ?",
-                    (code,)
-                )
-                conn.commit()
-            conn.close()
 
         # сообщаем пользователю об результате
         try:
@@ -859,15 +782,19 @@ async def handle_myads_price_input(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Цикл ввода цены для действий dec / rise, с проверкой и репостом."""
+    """
+    Ввод новой цены в потоке /myads (для действий ⬇ dec / ⬆ rise).
+    Работает БЕЗ sqlite: ищет объект через search_* и делает репост
+    через repost_object_in_channel(), где уже обновляется БД.
+    """
     data = context.user_data
     uid  = update.effective_user.id
 
-    # 1) удаляем прошлое предупреждение
+    # 1) удалить прошлое предупреждение (если было)
     if (mid := data.pop("ask_price_mid", None)):
         try:
             await context.bot.delete_message(uid, mid)
-        except:
+        except Exception:
             pass
 
     code   = data.get("pending_code")
@@ -875,38 +802,40 @@ async def handle_myads_price_input(
     if not code or action not in ("dec", "rise"):
         return MYADS_SHOW
 
-    # 2) вынимаем только цифры и форматируем
-    digits = re.sub(r"\D", "", update.message.text)
+    # 2) вынимаем только цифры
+    raw_text = (update.message.text or "").strip()
+    digits   = re.sub(r"\D", "", raw_text)
+    if not digits:
+        msg = await update.message.reply_text("Введите число. Попробуйте ещё раз:")
+        data["ask_price_mid"] = msg.message_id
+        return MYADS_PRICE
 
-    # 3) получаем запись из БД (SELECT * WHERE object_code)
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    rec   = None
-    table = None
-    for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(f"SELECT * FROM {tbl} WHERE object_code = ?", (code,))
-        row = cur.fetchone()
-        if row:
-            cols = [c[0] for c in cur.description]
-            rec   = dict(zip(cols, row))
-            table = tbl
+    # 3) найдём объект (через search_*). Нужен для проверки аренды
+    rec = None
+    for search_fn in (search_old_fund, search_new_fund, search_land, search_commerce):
+        try:
+            r = search_fn(code)          # ожидается, что вернёт dict по object_code
+        except TypeError:
+            # на случай старых сигнатур: пробуем как keyword
+            r = search_fn(object_code=code)
+        if r:
+            rec = r
             break
-    conn.close()
 
     if not rec:
         await update.message.reply_text("❌ Объявление не найдено. Попробуйте /myads.")
         return ConversationHandler.END
 
-    # 4) проверяем: если это аренда — снижаем требование по длине
-    is_rent = (rec.get("order_type") or "").lower() == "аренда"
-    if len(digits) < 5 and not is_rent:
-        msg = await update.message.reply_text(
-            "Цена должна быть минимум 5-значной. Попробуйте ещё раз:"
-        )
+    # 4) проверяем минимальную длину для продажи (для аренды не требуем)
+    is_rent = (
+        str(rec.get("order_type") or rec.get("Тип заявки") or "").strip().lower()
+        == "аренда"
+    )
+    if (not is_rent) and len(digits) < 5:
+        msg = await update.message.reply_text("Цена должна быть минимум 5-значной. Попробуйте ещё раз:")
         data["ask_price_mid"] = msg.message_id
         return MYADS_PRICE
 
-    new_price = _format_price(digits)
     # 5) текущее значение из БД
     cur_price = await _current_price(code)
     if not cur_price:
@@ -914,17 +843,21 @@ async def handle_myads_price_input(
         return ConversationHandler.END
     cur_val, cur_pretty = cur_price
 
-    # 6) Снижение + репост
+    # 6) формат новой цены
+    new_price_str = _format_price(digits)
+    new_val       = int(digits)
+
+    # 7) логика действий
     if action == "dec":
-        if int(digits) >= cur_val:
+        if new_val >= cur_val:
             msg = await update.message.reply_text(
-                f"Новая цена ({new_price}) не ниже текущей ({cur_pretty}). Введите другую:"
+                f"Новая цена ({new_price_str}) не ниже текущей ({cur_pretty}). Введите другую:"
             )
             data["ask_price_mid"] = msg.message_id
             return MYADS_PRICE
 
         await update.message.reply_text("⏳ Снижаю цену и репощу…")
-        ok = await repost_object_in_channel(context.bot, code, new_price, uid)
+        ok = await repost_object_in_channel(context.bot, code, new_price_str, uid)
         if ok:
             data.clear()
             await update.message.reply_text("✅ Цена снижена и объявление репощено.")
@@ -934,90 +867,130 @@ async def handle_myads_price_input(
             data["ask_price_mid"] = msg.message_id
             return MYADS_PRICE
 
-    # 7) Повышение цены
-    if action == "rise":
-        if int(digits) <= cur_val:
-            msg = await update.message.reply_text(
-                f"Новая цена ({new_price}) не выше текущей ({cur_pretty}). Введите другую:"
-            )
-            data["ask_price_mid"] = msg.message_id
-            return MYADS_PRICE
+    # action == "rise"
+    if new_val <= cur_val:
+        msg = await update.message.reply_text(
+            f"Новая цена ({new_price_str}) не выше текущей ({cur_pretty}). Введите другую:"
+        )
+        data["ask_price_mid"] = msg.message_id
+        return MYADS_PRICE
 
-        await update.message.reply_text("⏳ Повышаю цену и репощу…")
-        ok = await repost_object_in_channel(context.bot, code, new_price, uid)
-        if ok:
-            data.clear()
-            await update.message.reply_text("✅ Цена повышена и объявление репощено.")
-            return ConversationHandler.END
-        else:
-            msg = await update.message.reply_text("❌ Не удалось репостнуть новую цену. Попробуйте позже:")
-            data["ask_price_mid"] = msg.message_id
-            return MYADS_PRICE
+    await update.message.reply_text("⏳ Повышаю цену и репощу…")
+    ok = await repost_object_in_channel(context.bot, code, new_price_str, uid)
+    if ok:
+        data.clear()
+        await update.message.reply_text("✅ Цена повышена и объявление репощено.")
+        return ConversationHandler.END
+    else:
+        msg = await update.message.reply_text("❌ Не удалось репостнуть новую цену. Попробуйте позже:")
+        data["ask_price_mid"] = msg.message_id
+        return MYADS_PRICE
 
-    return MYADS_SHOW
 
 async def update_price_in_channel(bot: Bot, code: str, new_price: str) -> bool:
     """
-    Снижает цену, обновляет подпись (с зачёркнутой старой) и БД.
+    Снижение цены «на месте»:
+      1) находим объект и актуальный message_id обложки поста в канале;
+      2) проверяем, что новая цена действительно ниже текущей;
+      3) обновляем подпись у обложки (зачёркиваем старую цену);
+      4) фиксируем снижение в БД через drop_price_* (сохранит old_price и поставит price=new_price).
+
+    Исправления:
+      • брались неверные ключи («Цена» вместо «price») для вычислений;
+      • не было надёжного fallback, если в БД не заполнен channel_message_id;
+      • приводим данные к формату, который ожидает build_caption().
     """
-    # 1. поиск записи (без изменений) …
-    for tbl, search_fn, drop_fn, upd_fn in (
-        ("old_fund", search_old_fund, drop_price_old_fund, update_price_old_fund),
-        ("new_fund", search_new_fund, drop_price_new_fund, update_price_new_fund),
-        ("land",     search_land,     drop_price_land,     update_price_land),
-        ("commerce", search_commerce, drop_price_commerce, update_price_commerce),
+    # 1) Найдём запись и подходящие функции БД
+    rec = None
+    drop_fn = None
+    for tbl, search_fn, df in (
+        ("old_fund", search_old_fund, drop_price_old_fund),
+        ("new_fund", search_new_fund, drop_price_new_fund),
+        ("land",     search_land,     drop_price_land),
+        ("commerce", search_commerce, drop_price_commerce),
     ):
-        rec = search_fn(code)
-        if rec:
+        r = search_fn(code)
+        if r:
+            rec = r
+            drop_fn = df
             break
-    else:
-        logger.error(f"Объявление {code} не найдено при снижении цены")
+    if not rec:
+        logger.error("update_price_in_channel: объект %s не найден", code)
         return False
 
-    # 2. вычисления (без изменений) …
-    msg_id   = rec.get("channel_message_id")
-    raw_price = rec.get("Цена", "")
-    cur_val   = int(re.sub(r"\D", "", raw_price))
-    new_val   = int(re.sub(r"\D", "", new_price))
+    # 2) Текущая цена из БД (в ней хранится в поле 'price')
+    raw_price = rec.get("price") or rec.get("Цена") or ""
+    try:
+        cur_val = int(re.sub(r"\D", "", raw_price))
+        new_val = int(re.sub(r"\D", "", new_price))
+    except ValueError:
+        logger.error("update_price_in_channel: не распознаны цены (%r → %r)", raw_price, new_price)
+        return False
     if new_val >= cur_val:
+        # снижение не происходит
         return False
 
-    # 3. подготавливаем данные для build_caption  ̶(̶т̶у̶т̶ ̶и̶д̶ё̶т̶ ̶ф̶л̶а̶г̶)̶
-    rec["old_price"]        = raw_price          # обязательно сохраняем старую
-    rec["Цена"]             = new_price
-    rec["_price_drop_flag"] = True               # ← ключевой флаг для зачёркивания
+    # 3) message_id обложки — сначала пробуем channel_message_id, затем первый из message_ids
+    msg_id = rec.get("channel_message_id")
+    if not msg_id:
+        ids = rec.get("message_ids") or []
+        if isinstance(ids, str):
+            try:
+                ids = json.loads(ids)
+            except Exception:
+                ids = []
+        if ids:
+            msg_id = ids[0]
+    if not msg_id:
+        logger.error("update_price_in_channel: у %s нет channel_message_id и message_ids", code)
+        return False
 
-    caption = build_caption(rec, bot.username)
+    # 4) Готовим данные для build_caption()
+    #    (build_caption ожидает поле «Цена» и, при снижении, old_price + флаг)
+    rec_for_caption = dict(rec)
+    rec_for_caption["old_price"]        = raw_price
+    rec_for_caption["Цена"]             = new_price
+    rec_for_caption["_price_drop_flag"] = True
+    # Тип + тип сделки
+    table_to_ptype = {
+        "old_fund": "Старыйфонд",
+        "new_fund": "Новыйфонд",
+        "land":     "Участок",
+        "commerce": "Коммерция",
+    }
+    # Попробуем определить таблицу (если выше не сохранили)
 
-    # 4. ме-дия-редакт (без изменений) …
+        # если не смогли — оставим как есть; build_caption переживёт
+    rec_for_caption.setdefault("ptype", table_to_ptype.get(tbl, rec.get("ptype", "Старыйфонд")))
+    rec_for_caption.setdefault("Тип заявки", rec.get("order_type") or "Продажа")
+    # Также подстрахуем «Цена» (если кто-то потом вызовет без наших подстановок)
+    rec_for_caption.setdefault("Цена", new_price)
+
+    caption = build_caption(rec_for_caption, bot.username)
+
+    # 5) Меняем подпись у обложки
     try:
         await bot.edit_message_caption(
-            chat_id   = CHANNEL_ID,
-            message_id= msg_id,
-            caption   = caption,
-            parse_mode= "HTML",
+            chat_id=CHANNEL_ID,
+            message_id=int(msg_id),
+            caption=caption,
+            parse_mode="HTML",
         )
     except Exception as e:
-        logger.error(f"Failed to edit caption for {code}: {e}")
+        logger.error("update_price_in_channel: edit_message_caption failed for %s: %s", code, e)
         return False
 
-    # 5. обновление базы (без изменений) …
-    drop_fn(code, new_price)
+    # 6) Фиксируем снижение в БД
+    try:
+        drop_fn(code, new_price)
+    except Exception as e:
+        logger.error("update_price_in_channel: drop_fn failed for %s: %s", code, e)
+        return False
+
     return True
 
-async def update_price_in_channel_raise(
-    bot: Bot,
-    code: str,
-    new_price: str
-) -> bool:
-    """
-    Повышает цену в канале по кнопке «Повысить»:
-    - Если new_price ≤ old_price: старое old_price не меняется,
-      price = new_price, остаётся 🔥Цена снижена и зачёркнутая old_price.
-    - Если new_price > old_price: переносит текущую price → old_price,
-      ставит price = new_price, убирает 🔥 и зачёркивание.
-    Затем удаляет старый пост, репостит новый и обновляет repost_date.
-    """
+
+async def update_price_in_channel_raise(bot: Bot, code: str, new_price: str) -> bool:
     # 1) Найти запись и таблицу
     for tbl, search_fn, drop_fn, upd_fn in (
         ("old_fund",   search_old_fund,   drop_price_old_fund,   update_price_old_fund),
@@ -1037,40 +1010,32 @@ async def update_price_in_channel_raise(
         logger.error(f"No channel_message_id for {code}")
         return False
 
-    # 2) Получить числовые значения
     baseline_str = rec.get("old_price") or rec.get("price", "")
-    current_str  = rec.get("price", "")
+    base_val     = int(re.sub(r"\D", "", baseline_str or "0"))
+    new_val      = int(re.sub(r"\D", "", new_price or "0"))
 
-    base_val = int(re.sub(r"\D", "", baseline_str))
-    new_val  = int(re.sub(r"\D", "", new_price))
-
-    # 3) Две логики в зависимости от сравнения
     if new_val <= base_val:
-        # Всё ещё «горячий» коридор: old_price не меняется
+        # всё ещё «горячая» зона — old_price не меняем
         rec["old_price"]        = baseline_str
         rec["Цена"]             = new_price
         rec["_price_drop_flag"] = True
-        # Обновляем только price
         upd_fn(code, new_price)
     else:
-        rec["old_price"] = None
-        rec["Цена"] = new_price
+        # снимаем «горячий» режим
+        rec["old_price"]        = None
+        rec["Цена"]             = new_price
         rec["_price_drop_flag"] = False
-        upd_fn(code, new_price)  # обновляем только price
-        conn = sqlite3.connect(DB_FILE)  # + обнуляем колонку в БД
-        conn.execute(f"UPDATE {tbl} SET old_price = NULL WHERE object_code = ?", (code,))
-        conn.commit(); conn.close()
+        upd_fn(code, new_price)
+        clear_old_price(tbl, code)
 
-    # 4) Репост: удалить старое сообщение
+    # 4) удаляем старый пост в канале (если получится)
     await delete_object_in_channel(bot, code, deactivate=False, use_saved_ids=True)
 
-    # 5) Постим заново
+    # 5) репостим с новой ценой
     caption = build_caption(rec, bot.username)
-    photos = json.loads(rec.get("photos", "[]") or "[]")
-    videos = json.loads(rec.get("videos", "[]") or "[]")
-    media  = _pack_media(photos, videos, caption)
-
-
+    photos  = rec.get("photos") or []
+    videos  = rec.get("videos") or []
+    media   = _pack_media(photos, videos, caption)
     if not media:
         logger.error(f"No media for repost {code}")
         return False
@@ -1081,18 +1046,9 @@ async def update_price_in_channel_raise(
         logger.error(f"Failed to repost media for {code}: {e}")
         return False
 
-    # 6) Обновить message_id и repost_date в БД
-    new_msg_id = sent_msgs[0].message_id
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute(
-        f"UPDATE {tbl} "
-        "   SET channel_message_id = ?, repost_date = CURRENT_TIMESTAMP "
-        " WHERE object_code = ?",
-        (new_msg_id, code)
-    )
-    conn.commit()
-    conn.close()
+    # 6) сохраняем новые message_ids + repost_date
+    new_ids = [m.message_id for m in sent_msgs]
+    update_message_ids_and_repost_date(tbl, code, new_ids)
 
     return True
 
@@ -1137,237 +1093,205 @@ def md2_escape(text: str) -> str:
     """Экранирует спец-символы MarkdownV2."""
     return re.sub(_MD2_SPECIAL, r'\\\g<0>', text)
 
-async def repost_object_in_channel(
-    bot,
-    code: str,
-    new_price: Optional[str],
-    user_id: int
-) -> bool:
+async def repost_object_in_channel(bot, code: str, new_price: Optional[str], user_id: int) -> bool:
     """
-    Репостит объявление:
-      - new_price=None  → обычный репост не чаще 3 дней.
-      - new_price задана → «горячее» обновление цены:
-         • new_val < cur_val:
-             – drop_price: old_price = cur_price, price = new_price, 🔥.
-         • new_val >= cur_val:
-             – если есть old_price и new_val < old_price:
-                 * price = new_price, old_price не меняется, 🔥.
-             – иначе:
-                 * drop_price: old_price = cur_price, price = new_price, без 🔥.
-    Затем всегда пытается удалить старый пост (но не зависит от успеха),
-    публикует новый, обновляет message_ids и repost_date.
+    Репост объекта в канал (с опциональным обновлением цены).
+
+    Исправления:
+      • раньше build_caption получал «сырые» ключи из БД (orientir, price, ...),
+        из-за чего цена/поля могли не попасть в подпись. Теперь мы явно
+        формируем словарь с «человеческими» полями («Цена», «Ориентир», …).
+      • добавлен корректный fallback на ограничение частоты репоста.
     """
-    # 1) Извлечь запись и таблицу
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
+    # 1) Ищем запись и определяем таблицу
     rec, table = None, None
-
-    for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(f"SELECT * FROM {tbl} WHERE object_code = ?", (code,))
-        row = cur.fetchone()
-        if row:
-            cols = [c[0] for c in cur.description]
-            rec   = dict(zip(cols, row))
-            table = tbl
+    for tbl, search_fn in (("old_fund", search_old_fund),
+                           ("new_fund", search_new_fund),
+                           ("land",     search_land),
+                           ("commerce", search_commerce)):
+        r = search_fn(code)
+        if r:
+            rec, table = r, tbl
             break
-
     if not rec:
-        conn.close()
         return False
 
-    # 2) Обычный репост: не чаще 3 дней
+    # 2) Ограничение по частоте (если цена не меняется)
     if new_price is None and rec.get("repost_date"):
-        last  = datetime.fromisoformat(rec["repost_date"])
-        delta = datetime.utcnow() - last
+        rdate = rec["repost_date"]
+        if isinstance(rdate, str):
+            try:
+                rdate = datetime.fromisoformat(rdate)
+            except Exception:
+                rdate = None
+        delta = (datetime.utcnow() - rdate) if rdate else timedelta(days=999)
         limit = timedelta(days=1) if rec.get("old_price") else timedelta(days=3)
         if delta < limit:
             if user_id:
                 rem = limit - delta
                 await bot.send_message(
                     chat_id=user_id,
-                    text=(
-                        f"❗️ Объект {code} можно репостнуть через "
-                        f"{rem.days} д {rem.seconds // 3600} ч."
-                    )
+                    text=f"❗️ Объект {code} можно репостнуть через {rem.days} д {rem.seconds // 3600} ч."
                 )
-            conn.close()
             return False
 
-    # 3) «Горячее» обновление цены, если задано new_price
+    # 3) Подготовим «человеческий» dict для build_caption()
+    def _norm_commerce_purpose(val):
+        if isinstance(val, list):
+            return ", ".join(val)
+        return val
+
+    data = {
+        "ptype":        TABLE_PTYPE[table],
+        "Тип заявки":   rec.get("order_type", "Продажа"),
+        "object_code":  rec.get("object_code"),
+        "district":     rec.get("district"),
+    }
+
+    if table == "old_fund":
+        data.update({
+            "Ориентир":           rec.get("orientir"),
+            "Комнаты":            rec.get("komnaty"),
+            "Площадь":            rec.get("ploshad"),
+            "Этаж":               rec.get("etazh"),
+            "Этажность":          rec.get("etazhnost"),
+            "Санузлы":            rec.get("sanuzly"),
+            "Состояние":          rec.get("sostoyanie"),
+            "Материал строения":  rec.get("material"),
+            "Дополнительно":      rec.get("dop_info"),
+            "Цена":               rec.get("price"),
+        })
+    elif table == "new_fund":
+        data.update({
+            "Ориентир":           rec.get("orientir"),
+            "ЖК":                 rec.get("jk"),
+            "Год постройки":      rec.get("year"),
+            "Комнаты":            rec.get("komnaty"),
+            "Площадь":            rec.get("ploshad"),
+            "Этаж":               rec.get("etazh"),
+            "Этажность":          rec.get("etazhnost"),
+            "Санузлы":            rec.get("sanuzly"),
+            "Состояние":          rec.get("sostoyanie"),
+            "Материал строения":  rec.get("material"),
+            "Дополнительно":      rec.get("dop_info"),
+            "Цена":               rec.get("price"),
+        })
+    elif table == "land":
+        data.update({
+            "Ориентир":           rec.get("orientir"),
+            "Площадь участка":    rec.get("ploshad_uchastok"),
+            "Площадь дома":       rec.get("ploshad_dom"),
+            "Размер участка":     rec.get("razmer"),
+            "Этажность":          rec.get("etazhnost"),
+            "Санузлы":            rec.get("sanuzly"),
+            "Состояние":          rec.get("sostoyanie"),
+            "Материал строения":  rec.get("material"),
+            "Заезд авто":         rec.get("zaezd"),
+            "Дополнительно":      rec.get("dop_info"),
+            "Цена":               rec.get("price"),
+        })
+    else:  # commerce
+        data.update({
+            "Ориентир":           rec.get("orientir"),
+            "Целевое назначение": _norm_commerce_purpose(rec.get("nazna4enie")),
+            "Расположение":       rec.get("raspolozhenie"),
+            "Этаж":               rec.get("etazh"),
+            "Этажность":          rec.get("etazhnost"),
+            "Площадь помещения":  rec.get("ploshad_pom"),
+            "Площадь участка":    rec.get("ploshad_uchastok"),
+            "Учёт НДС":           rec.get("nds") if (rec.get("order_type") or "").lower() == "аренда" else None,
+            "Собственник":        rec.get("owner") if (rec.get("order_type") or "").lower() == "аренда" else None,
+            "Дополнительно":      rec.get("dop_info"),
+            "Цена":               rec.get("price"),
+        })
+
+    # Учитываем «горячий» флаг из БД
+    if rec.get("old_price"):
+        data["old_price"] = rec["old_price"]
+        data["_price_drop_flag"] = True
+
+    # 4) Если задано изменение цены — обновим БД и данные для подписи
     if new_price:
         cur_str      = rec.get("price", "") or ""
         baseline_str = rec.get("old_price") or cur_str
+        try:
+            cur_val  = int(re.sub(r"\D", "", cur_str or "0"))
+            base_val = int(re.sub(r"\D", "", baseline_str or "0"))
+            new_val  = int(re.sub(r"\D", "", new_price or "0"))
+        except ValueError:
+            return False
 
-        cur_val  = int(re.sub(r"\D", "", cur_str))
-        base_val = int(re.sub(r"\D", "", baseline_str))
-        new_val  = int(re.sub(r"\D", "", new_price))
-
-        # 3a) Снижение цены
         if new_val < cur_val:
-            drop_funcs = {
-                "old_fund":   drop_price_old_fund,
-                "new_fund":   drop_price_new_fund,
-                "land":       drop_price_land,
-                "commerce":   drop_price_commerce,
-            }
-            drop_funcs[table](code, new_price)
-            rec["old_price"]        = cur_str
-            rec["price"]            = new_price
-            rec["_price_drop_flag"] = True
-
-        # 3b) Повышение или равенство цены
+            {
+                "old_fund": drop_price_old_fund,
+                "new_fund": drop_price_new_fund,
+                "land":     drop_price_land,
+                "commerce": drop_price_commerce,
+            }[table](code, new_price)
+            data["old_price"]        = cur_str
+            data["Цена"]             = new_price
+            data["_price_drop_flag"] = True
         else:
-            up_funcs = {
-                "old_fund":   update_price_old_fund,
-                "new_fund":   update_price_new_fund,
-                "land":       update_price_land,
-                "commerce":   update_price_commerce,
-            }
-            if rec.get("old_price"):
-                if new_val < base_val:
-                    up_funcs[table](code, new_price)
-                    rec["old_price"]        = baseline_str
-                    rec["price"]            = new_price
-                    rec["_price_drop_flag"] = True
-                else:
-                    up_funcs[table](code, new_price)
-                    rec["old_price"]        = None
-                    rec["price"]            = new_price
-                    rec["_price_drop_flag"] = False
-                    conn.execute(
-                        f"UPDATE {table} SET old_price = NULL WHERE object_code = ?",
-                        (code,)
-                    )
-                    conn.commit()
-            else:
-                up_funcs[table](code, new_price)
-                rec["old_price"]        = None
-                rec["price"]            = new_price
-                rec["_price_drop_flag"] = False
+            {
+                "old_fund": update_price_old_fund,
+                "new_fund": update_price_new_fund,
+                "land":     update_price_land,
+                "commerce": update_price_commerce,
+            }[table](code, new_price)
 
-    # 3c) Обычный репост: считаем флаг 🔥 по старой цене, если new_price не задан
+            if rec.get("old_price") and new_val < base_val:
+                data["old_price"]        = baseline_str
+                data["Цена"]             = new_price
+                data["_price_drop_flag"] = True
+            else:
+                data["old_price"]        = None
+                data["Цена"]             = new_price
+                data["_price_drop_flag"] = False
+                clear_old_price(table, code)
     else:
-        rec["_price_drop_flag"] = False
+        # «Холодный» репост: решаем, показывать ли 🔥
+        data["_price_drop_flag"] = False
         if rec.get("old_price") and rec.get("updated_at"):
-            last = datetime.fromisoformat(rec["updated_at"])
-            if datetime.now() - last <= timedelta(weeks=5):
-                old_val = int(re.sub(r"\D", "", rec["old_price"]))
-                cur_val = int(re.sub(r"\D", "", rec.get("price", "") or "0"))
-                if old_val > cur_val:
-                    rec["_price_drop_flag"] = True
+            last = rec["updated_at"]
+            if isinstance(last, str):
+                try:
+                    last = datetime.fromisoformat(last)
+                except Exception:
+                    last = None
+            if last and (datetime.utcnow() - last) <= timedelta(weeks=5):
+                try:
+                    old_val = int(re.sub(r"\D", "", rec["old_price"]))
+                    cur_val = int(re.sub(r"\D", "", (rec.get("price") or "0")))
+                    if old_val > cur_val:
+                        data["_price_drop_flag"] = True
+                except Exception:
+                    pass
             else:
-                rec["old_price"]        = None
-                rec["_price_drop_flag"] = False
-                conn.execute(
-                    f"UPDATE {table} SET old_price = NULL WHERE object_code = ?",
-                    (code,)
-                )
-                conn.commit()
+                data["old_price"]        = None
+                data["_price_drop_flag"] = False
+                clear_old_price(table, code)
 
-    # 4) Пробуем удалить старый пост, но игнорируем ошибки
+    # 5) Удаляем старые сообщения (если были)
     await delete_object_in_channel(bot, code, deactivate=False, use_saved_ids=True)
 
-    # 5) Переименовываем поля для build_caption
-    ptype_map = {
-        "old_fund": "Старыйфонд",
-        "new_fund": "Новыйфонд",
-        "land":     "Участок",
-        "commerce": "Коммерция",
-    }
-    rec["ptype"]      = ptype_map[table]
-    rec["Тип заявки"] = rec.get("order_type", "Продажа")
-
-    if table in ("old_fund", "new_fund"):
-        rec["Ориентир"]          = rec.pop("orientir", None)
-        rec["Район"]             = rec.pop("district", None)
-        rec["Комнаты"]           = rec.pop("komnaty", None)
-        rec["Площадь"]           = rec.pop("ploshad", None)
-        rec["Этаж"]              = rec.pop("etazh", None)
-        rec["Этажность"]         = rec.pop("etazhnost", None)
-        rec["Санузлы"]           = rec.pop("sanuzly", None)
-        rec["Состояние"]         = rec.pop("sostoyanie", None)
-        rec["Материал строения"] = rec.pop("material", None)
-        rec["Дополнительно"]     = rec.pop("dop_info", None)
-        rec["Цена"]              = rec.pop("price", None)
-        if table == "new_fund":
-            rec["ЖК"]            = rec.pop("jk", None)
-            rec["Год постройки"] = rec.pop("year", None)
-        else:
-            rec["Парковка"]      = rec.pop("parkovka", None)
-
-    elif table == "land":
-        rec["Ориентир"]           = rec.pop("orientir", None)
-        rec["Район"]              = rec.pop("district", None)
-        rec["Тип недвижимости"]   = rec.pop("type", None)
-        rec["Год постройки"]      = rec.pop("year", None)
-        rec["Площадь участка"]    = rec.pop("ploshad_uchastok", None)
-        rec["Площадь дома"]       = rec.pop("ploshad_dom", None)
-        rec["Размер участка"]     = rec.pop("razmer", None)
-        rec["Этажность"]          = rec.pop("etazhnost", None)
-        rec["Санузлы"]            = rec.pop("sanuzly", None)
-        rec["Состояние"]          = rec.pop("sostoyanie", None)
-        rec["Материал строения"]  = rec.pop("material", None)
-        rec["Заезд авто"]         = rec.pop("zaezd", None)
-        rec["Дополнительно"]      = rec.pop("dop_info", None)
-        rec["Цена"]               = rec.pop("price", None)
-
-    else:  # commerce
-        rec["Ориентир"]            = rec.pop("orientir", None)
-        rec["Район"]               = rec.pop("district", None)
-        rec["Целевое назначение"]  = rec.pop("nazna4enie", None)
-        rec["Расположение"]        = rec.pop("raspolozhenie", None)
-        rec["Этаж"]                = rec.pop("etazh", None)
-        rec["Этажность"]           = rec.pop("etazhnost", None)
-        rec["Площадь помещения"]   = rec.pop("ploshad_pom", None)
-        rec["Площадь участка"]     = rec.pop("ploshad_uchastok", None)
-        rec["Учёт НДС"]            = rec.pop("nds", None)
-        rec["Собственник"]         = rec.pop("owner", None)
-        rec["Дополнительно"]       = rec.pop("dop_info", None)
-        rec["Цена"]                = rec.pop("price", None)
-
-    conn.close()
-
-    # 6) Собираем подпись и медиагруппу
-    caption = build_caption(rec, bot.username)
-
-    # локальный помощник: безопасно превращает JSON-строку или list → list[str]
-    def _as_list(raw) -> list[str]:
-        if isinstance(raw, list):
-            return raw
-        if isinstance(raw, str):
-            try:
-                return json.loads(raw)
-            except Exception:
-                logger.warning("Bad JSON in photos/videos: %s", raw)
-        return []
-
-    photos = _as_list(rec.get("photos"))
-    videos = _as_list(rec.get("videos"))
-    media  = _pack_media(photos, videos, caption)
-
+    # 6) Публикуем заново
+    caption = _cap(build_caption(data, bot.username))
+    photos  = (rec.get("photos") or [])
+    videos  = (rec.get("videos") or [])
+    media   = _pack_media(photos, videos, caption)
     if not media:
         return False
 
-    # 7) Отправляем и сохраняем новые message_ids и repost_date
     try:
         sent = await bot.send_media_group(CHANNEL_ID, media)
     except Exception as e:
-        logger.error(f"Не удалось репостнуть объект {code}: {e}")
+        logger.error("Не удалось репостнуть объект %s: %s", code, e)
         return False
 
     new_ids = [m.message_id for m in sent]
-    conn    = sqlite3.connect(DB_FILE)
-    cur     = conn.cursor()
-    cur.execute(
-        f"UPDATE {table} "
-        "   SET message_ids = ?, repost_date = CURRENT_TIMESTAMP "
-        " WHERE object_code = ?",
-        (json.dumps(new_ids), code)
-    )
-    conn.commit()
-    conn.close()
-
+    update_message_ids_and_repost_date(table, code, new_ids)
     return True
+
 
 # ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────
 def load_allowed_ids() -> set[int]:
@@ -1408,9 +1332,15 @@ def required_fields(data: dict) -> List[str]:
     return get_template(data)["required"]
 
 def all_option_fields() -> set[str]:
-    res = set()
-    for t in TEMPLATES.values():
-        res.update(t["menu"].keys())
+    """
+    Возвращает множество всех полей из секций «menu» для всех типов и вариантов сделок.
+    Ранее функция пыталась читать поле 'menu' сразу у верхнего уровня TEMPLATES,
+    из-за чего падала. Теперь корректно итерируемся по «Продажа»/«Аренда».
+    """
+    res: set[str] = set()
+    for deals in TEMPLATES.values():                 # {"Продажа": {...}, "Аренда": {...}}
+        for variant in deals.values():               # {..., "menu": {...}, "manual": [...], ...}
+            res.update(variant.get("menu", {}).keys())
     return res
 
 # ─── CSV-УТИЛИТЫ для заявок (без изменений) ────────────────────────
@@ -1420,19 +1350,7 @@ CSV_HEADER = [
 ]
 
 def has_client_secondary_request(user_id: int, object_code: str) -> bool:
-    """
-    Проверяет, оставлял ли пользователь user_id уже заявку
-    на объект object_code в таблице client_secondary.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM client_secondary WHERE user_id = ? AND object_code = ? LIMIT 1",
-        (user_id, object_code)
-    )
-    found = cur.fetchone() is not None
-    conn.close()
-    return found
+    return client_secondary_exists(user_id, object_code)
 
 def _join_l(*parts) -> str:
     """Соединяет непустые куски через ' l '."""
@@ -1541,53 +1459,59 @@ def format_floors(floors: int | str | None) -> str | None:
 
 def build_caption(rec: dict, bot_username: str) -> str:
     """
-    Полностью учитывает:
-      • 🔑-строку с заглавным «Год постройки» при отсутствии ЖК;
-      • материал в старом/новом фонде с маленькой буквы;
-      • корректную шапку «Дом / Земельный участок | 4 сот».
+    Формирует подпись к объекту для канала и ЛС.
+
+    Дополнительно исправлено:
+      • добавлены fallback'и на ключи из БД (price/orientir/jk/year/sanuzly/…),
+        чтобы функция одинаково работала как с «внутренними», так и с
+        «человеческими» полями.
     """
-    ptype = rec.get("ptype") or "Старыйфонд"
-    deal  = rec.get("Тип заявки")
+    def _g(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v not in (None, ""):
+                return v
+        return None
+
+    ptype = _g(rec, "ptype") or "Старыйфонд"
+    deal  = _g(rec, "Тип заявки")
     title = f"#{ptype}" + (f" #{deal}" if deal else "")
 
-    # --- 🔥 Цена снижена -------------------------------------------------
     old_price = rec.get("old_price") if rec.get("_price_drop_flag") else None
     header = [title]
     if old_price:
         header.append("🔥Цена снижена")
-    header.append("")             # пустая строка-разделитель
+    header.append("")
 
-    lines = header                # сюда будем добавлять остальное
+    lines = header
 
-    # --- общие переменные -----------------------------------------------
-    rooms    = rec.get("Комнаты")
-    area     = (rec.get("Площадь") or
-                rec.get("Площадь помещения") or
-                rec.get("Площадь участка"))
-    district = rec.get("district") or rec.get("Район")
-    orientir = rec.get("Ориентир")
+    # Общие переменные (с fallback на «внутренние» ключи БД)
+    rooms    = _g(rec, "Комнаты", "komnaty")
+    area     = _g(rec, "Площадь", "ploshad", "Площадь помещения", "ploshad_pom", "Площадь участка", "ploshad_uchastok")
+    district = _g(rec, "district", "Район")
+    orientir = _g(rec, "Ориентир", "orientir")
 
-    floor    = rec.get("Этаж")
-    floors   = rec.get("Этажность")
-    material = rec.get("Материал строения") or rec.get("Материал")
+    floor    = _g(rec, "Этаж", "etazh")
+    floors   = _g(rec, "Этажность", "etazhnost")
+    material = _g(rec, "Материал строения", "Материал", "material")
 
-    cond   = rec.get("Состояние")
-    baths  = rec.get("Санузлы")
-    jk     = rec.get("ЖК")
-    year   = rec.get("Год постройки")
+    cond   = _g(rec, "Состояние", "sostoyanie")
+    baths  = _g(rec, "Санузлы", "sanuzly")
+    jk     = _g(rec, "ЖК", "jk")
+    year   = _g(rec, "Год постройки", "year")
 
-    house_area = rec.get("Площадь дома")
-    lot_size   = rec.get("Размер участка")
-    drive_in   = rec.get("Заезд авто")
+    house_area = _g(rec, "Площадь дома", "ploshad_dom")
+    lot_size   = _g(rec, "Размер участка", "razmer")
+    drive_in   = _g(rec, "Заезд авто", "zaezd")
 
-    position = rec.get("Расположение")
-    purpose = rec.get("Целевое назначение")
-    if isinstance(purpose, list):  # мультивыбор
+    position = _g(rec, "Расположение", "raspolozhenie")
+    purpose  = _g(rec, "Целевое назначение", "nazna4enie")
+    if isinstance(purpose, list):
         purpose = ", ".join(purpose)
-    owner = rec.get("Собственник") if deal == "Аренда" else None
-    price = rec.get("Цена")
 
-    # --- блоки по типу объекта ------------------------------------------
+    owner = rec.get("Собственник") if deal == "Аренда" else None
+    price = _g(rec, "Цена", "price")
+
     if ptype in ("Старыйфонд", "Новыйфонд"):
         lines += [
             _line_summary(ptype, rooms, area),
@@ -1603,12 +1527,11 @@ def build_caption(rec: dict, bot_username: str) -> str:
         ]
 
     elif ptype == "Участок":
-        type_ned = rec.get("Тип недвижимости") or "Земельный участок"
+        type_ned = _g(rec, "Тип недвижимости", "fm") or "Земельный участок"
         lines += [
-            _line_summary(ptype, None, rec.get("Площадь участка"), type_ned),
+            _line_summary(ptype, None, _g(rec, "Площадь участка", "ploshad_uchastok"), type_ned),
             _line_location(district, orientir),
         ]
-                # 🏗 — материал/площадь дома (показываем, только если есть данные)
         house_line = _join_l(
             material and material.capitalize(),
             house_area and f"Площадь дома: {house_area}"
@@ -1616,12 +1539,8 @@ def build_caption(rec: dict, bot_username: str) -> str:
         if house_line:
             lines.append(f"🏗 {house_line}")
 
-        # 🔧 — состояние / этажность (как было)
-        lines.append(
-            f"🔧 {_join_l(cond, format_floors(floors))}"
-        )
+        lines.append(f"🔧 {_join_l(cond, format_floors(floors))}")
 
-        # 🚗 — заезд авто / размер участка (только при наличии)
         drive_line = _join_l(
             drive_in and ("Заезд авто" if drive_in == "Есть" else "Заезд авто отсутствует"),
             lot_size and (f'Размер участка: {lot_size}' if not drive_in else f'размер участка: {lot_size}')
@@ -1630,78 +1549,61 @@ def build_caption(rec: dict, bot_username: str) -> str:
             lines.append(f"🚗 {drive_line}")
 
     else:  # Коммерция
-        # Учёт НДС выводим только при аренде
         vat = rec.get("Учёт НДС") if deal == "Аренда" else None
-
         first = f"🏬 {purpose}" if purpose else "🏬"
         lines += [
             first,
             _line_location(district, orientir),
         ]
 
-        # ─ «📪 Расположение | этаж …» ─────────────────────────────
         if position or floor:
-            fl = (
-                floor and floors and f'этаж {floor} из {floors}'
-                or  floor and f'этаж {floor}'
-            )
-            # если Расположение пусто, пишем «Этаж …» с заглавной
+            fl = (floor and floors and f'этаж {floor} из {floors}') or (floor and f'этаж {floor}')
             if not position and fl:
-                fl = fl.capitalize()          # «Этаж …»
+                fl = fl.capitalize()
             lines.append(f"📪 {_join_l(position, fl)}")
 
-        # ─ площади помещения/участка ─────────────────────────────
         space_line = _join_l(
-            (rec.get('Площадь помещения') and f"Помещение: {rec['Площадь помещения']}"),
-            (rec.get('Площадь участка')   and f"участок: {rec['Площадь участка']}")
+            (_g(rec, 'Площадь помещения', 'ploshad_pom') and f"Помещение: {_g(rec, 'Площадь помещения', 'ploshad_pom')}"),
+            (_g(rec, 'Площадь участка', 'ploshad_uchastok') and f"участок: {_g(rec, 'Площадь участка', 'ploshad_uchastok')}")
         )
         if space_line:
             lines.append(f"🏗 {space_line}")
 
-        # ─ цена (+ НДС) ──────────────────────────────────────────
         if owner:
             lines.append(f"👨‍💼 Собственник: {owner}")
-        # ─ цена (+ НДС) ──────────────────────────────────────────
-        vat_str   = _bold(vat) if vat else ''
+
+        vat_str    = _bold(vat) if vat else ''
         price_core = f"{_bold(price)}{(' ' + vat_str) if vat else ''}"
         if old_price:
             lines.append(f"💵 <s>{old_price}</s> {price_core}")
         else:
             lines.append(f"💵 {price_core}")
 
-    # --- цена ------------------------------------------------------------
     if ptype != "Коммерция":
         if old_price:
             lines.append(f"💵 <s>{old_price}</s> <b>{price}</b>")
         else:
             lines.append(f"💵 <b>{price}</b>")
 
-    # --- Дополнительно ---------------------------------------------------
     extra = rec.get("Дополнительно")
     if extra:
         lines += ["", "Дополнительно:", extra]
 
-    # --- код + ссылки ----------------------------------------------------
-    code     = rec.get("object_code") or rec.get("code") or ""
-    realtor  = (rec.get("Риэлтор") or
-                rec.get("realtor")  or
-                rec.get("realtor_code", ""))
+    code     = _g(rec, "object_code", "code") or ""
+    realtor  = _g(rec, "Риэлтор", "realtor", "realtor_code") or ""
     link = f"https://t.me/{bot_username}?start=object={code}_realtor={realtor}"
-
 
     lines += [
         "", f"Код объекта: {code}", "",
         f'<a href="{link}">Оставить заявку</a>',
     ]
 
-    # финальная зачистка двойных пустых строк
     caption = "\n".join(
         ln.rstrip(" l")
         for i, ln in enumerate(lines)
         if ln or (i and lines[i - 1])
     )
     return caption
-
 
 EMOJI_BULLET = "•"
 
@@ -1828,23 +1730,6 @@ async def start_editing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # 1) формируем новый object_code
     obj_code = next_object_code()
 
-    # 2) проверяем, что такого object_code ещё нет в базе (status = active)
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    for table in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(
-            f"SELECT 1 FROM {table} "
-            "WHERE object_code = ? AND status = 'active' LIMIT 1",
-            (obj_code,)
-        )
-        if cur.fetchone():
-            await update.message.reply_text(
-                f"❗️ Объект {obj_code} уже опубликован.\n"
-                f"Перезапустите /ad, чтобы сгенерировать новый код."
-            )
-            conn.close()
-            return ConversationHandler.END
-    conn.close()
 
     # 3) сохраняем базовые поля объявления
     ud["object_code"]   = obj_code
@@ -1855,7 +1740,8 @@ async def start_editing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
 
     # 4) собираем медиагруппу с «правильной» подписью
-    initial_caption = build_caption(ud, context.bot.username)
+    initial_caption = _cap(build_caption(ud, context.bot.username))
+
     media_album: list[InputMedia] = []
     for i, m in enumerate(ud.get("album_msgs", [])):
         fid = m.photo[-1].file_id if m.photo else m.video.file_id
@@ -2213,11 +2099,13 @@ async def refresh_description(update: Update, context: ContextTypes.DEFAULT_TYPE
         except telegram.error.BadRequest:
             pass
 
-
 async def finalize_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Проверяет обязательные поля, отсутствие дубля по object_code
-    и публикует альбом в канал.
+    Проверяет обязательные поля, отсутствие дубля по object_code и публикует альбом в канал.
+
+    Исправления:
+      • удалён блок с необъявленной переменной `duplicate`;
+      • мелкие подчистки и страховки по типам.
     """
     ud      = context.user_data
     ptype   = ud.get("ptype", PROPERTY_TYPES[0])
@@ -2230,37 +2118,23 @@ async def finalize_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_chat.id,
             "Заполните все поля перед публикацией: " + ", ".join(missing)
         )
-        await refresh_description(update.effective_chat.id, context)
+        await refresh_description(update, context)
         return EDITING
 
-    # 2) защита от дублей: смотрим БД, статус = active
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    duplicate = False
-    for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(
-            f"SELECT 1 FROM {tbl} WHERE object_code = ? AND status = 'active' LIMIT 1",
-            (obj_id,)
-        )
-        if cur.fetchone():
-            duplicate = True
-            break
-    conn.close()
-
-    if duplicate:
-        # две лишние answer() нужны, чтобы убрать «часики» у callback-кнопки
+    # 2) проверка на дубликат object_code (активный)
+    if exists_active_object_code(obj_id):
+        # двойной answer() — чтобы убрать «часики» на нажатой кнопке
         await update.callback_query.answer()
         await update.callback_query.answer()
         await context.bot.send_message(
             update.effective_chat.id,
-            f"❗️ Объект с кодом {obj_id} уже опубликован в канале. "
-            f"Измените код или используйте /myads."
+            f"❗️ Объект с кодом {obj_id} уже опубликован в канале. Измените код или используйте /myads."
         )
-        await refresh_description(update.effective_chat.id, context)
+        await refresh_description(update, context)
         return EDITING
 
     # 3) строим caption + публикуем
-    caption_html = build_caption(ud, context.bot.username)
+    caption_html = _cap(build_caption(ud, context.bot.username))
 
     media_album = []
     for i, m in enumerate(ud["album_msgs"]):
@@ -2278,6 +2152,8 @@ async def finalize_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent = await context.bot.send_media_group(CHANNEL_ID, media_album)
         await update.callback_query.edit_message_text("✅ Опубликовано в канал.")
         message_ids = [m.message_id for m in sent]
+        table_map = {"Старыйфонд":"old_fund","Новыйфонд":"new_fund","Участок":"land","Коммерция":"commerce"}
+        update_message_ids_and_repost_date(table_map[ptype], obj_id, message_ids)
         first_msg = sent[0]
         link = (
             f"https://t.me/{first_msg.chat.username}/{first_msg.message_id}"
@@ -2288,54 +2164,34 @@ async def finalize_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text(f"Ошибка публикации: {e}")
         return EDITING
 
-    # ─── НОВЫЙ БЛОК: сохраняем в БД ──────────────────────────────────
+    # 4) сохраняем объект в БД
+    photos = [m.photo[-1].file_id for m in ud["album_msgs"] if getattr(m, "photo", None)]
+    videos = [m.video.file_id for m in ud["album_msgs"] if getattr(m, "video", None)]
 
-    # 1) Собираем file_id медиа, которые вы уже достали в media_album или сохранили в ud
-    photos = [m.photo[-1].file_id for m in ud["album_msgs"] if m.photo]
-    videos = [m.video.file_id for m in ud["album_msgs"] if m.video]
-
-    # 2) Подготавливаем общий словарь
     db_data = {
-        **ud,               # все поля, которые накопились (Ориентир, Район, Цена и т.п.)
+        **ud,
         "photos": photos,
         "videos": videos,
         "message_ids": message_ids,
     }
 
-    # 3) Вставляем в нужную таблицу
-    if ptype == "Старыйфонд":
-        insert_into_old_fund(db_data)
-    elif ptype == "Новыйфонд":
-        insert_into_new_fund(db_data)
-    elif ptype == "Участок":
-        insert_into_land(db_data)
-    elif ptype == "Коммерция":
-        insert_into_commerce(db_data)
+    try:
+        if ptype == "Старыйфонд":
+            insert_into_old_fund(db_data)
+        elif ptype == "Новыйфонд":
+            insert_into_new_fund(db_data)
+        elif ptype == "Участок":
+            insert_into_land(db_data)
+        elif ptype == "Коммерция":
+            insert_into_commerce(db_data)
+    except Exception as e:
+        # публикация уже прошла — лишь сообщим об ошибке сохранения
+        logger.error("finalize_publish: DB insert failed: %s", e)
 
-    # ────────────────────────────────────────────────────────────────
-
-    # 3-бис) репост-дата = время публикации
-    table_map = {
-        "Старыйфонд": "old_fund",
-        "Новыйфонд":  "new_fund",
-        "Участок":    "land",
-        "Коммерция":  "commerce",
-    }
-    tbl = table_map[ptype]
-
-    conn = sqlite3.connect(DB_FILE)
-    with conn:
-        conn.execute(
-            f"UPDATE {tbl} "
-            "SET repost_date = CURRENT_TIMESTAMP "
-            "WHERE object_code = ?",
-            (obj_id,)
-        )
-    conn.close()
-
-    # 4) Очищаем пользовательские данные и выходим
+    # 5) очистка state
     ud.clear()
     return ConversationHandler.END
+
 
 
 async def ad_error_and_cancel(update: Update, text: str):
@@ -2382,21 +2238,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     obj, realtor = m.groups()
 
-    # 3a) Проверяем статус объявления — должно быть active
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
     status = None
-    for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(f"SELECT status FROM {tbl} WHERE object_code = ? LIMIT 1", (obj,))
-        row = cur.fetchone()
-        if row:
-            status = row[0]
+    for search_fn in (search_old_fund, search_new_fund, search_land, search_commerce):
+        r = search_fn(obj)
+        if r:
+            status = r.get("status")
             break
-    conn.close()
     if status != "active":
-        await update.message.reply_text(
-            "❗️ К сожалению, на этот объект заявки закрыты."
-        )
+        await update.message.reply_text("❗️ К сожалению, на этот объект заявки закрыты.")
         return ConversationHandler.END
 
     # 3c) проверяем в БД exact user_id + object_code
@@ -2472,27 +2321,27 @@ async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_object_link(bot: Bot, code: str) -> Optional[str]:
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    for tbl in ("old_fund","new_fund","land","commerce"):
-        cur.execute(
-            f"SELECT message_ids FROM {tbl} WHERE object_code = ? AND status = 'active'",
-            (code,)
-        )
-        row = cur.fetchone()
-        if row and row[0]:
-            ids = json.loads(row[0])
-            first = ids[0]
-            # тут можно получить username один раз через bot.get_chat или хранить его константой
-            chat = await bot.get_chat(CHANNEL_ID)
-            if chat.username:
-                link = f"https://t.me/{chat.username}/{first}"
-            else:
-                link = f"https://t.me/c/{str(CHANNEL_ID)[4:]}/{first}"
-            conn.close()
-            return link
-    conn.close()
-    return None
+    rec = None
+    for search_fn in (search_old_fund, search_new_fund, search_land, search_commerce):
+        r = search_fn(code)
+        if r and r.get("status") == "active":
+            rec = r
+            break
+    if not rec:
+        return None
+
+    ids = rec.get("message_ids") or []
+    if isinstance(ids, str):
+        try: ids = json.loads(ids)
+        except Exception: ids = []
+    if not ids:
+        return None
+
+    first = ids[0]
+    chat = await bot.get_chat(CHANNEL_ID)
+    return (f"https://t.me/{chat.username}/{first}"
+            if chat.username else f"https://t.me/c/{str(CHANNEL_ID)[4:]}/{first}")
+
 
 
 TABLE_PTYPE = {
@@ -2504,109 +2353,45 @@ TABLE_PTYPE = {
 
 
 async def forward_object_post(bot, chat_id: int, code: str) -> bool:
-    """
-    Берёт из realty.db запись по object_code, собирает media_group
-    и отправляет пользователю только фото/видео + описание + код объекта,
-    без ссылок «Оставить заявку» и «Больше объектов…».
-    """
-    # 1) достаём запись из любой таблицы
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    # 1) ищем запись
     data = None
     table = None
-    for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(f"SELECT * FROM {tbl} WHERE object_code = ?", (code,))
-        row = cur.fetchone()
-        if row:
-            cols = [c[0] for c in cur.description]
-            data = dict(zip(cols, row))
-            data["ptype"] = TABLE_PTYPE[tbl]
-            data["Тип заявки"] = data.get("order_type", "Продажа")
-            table = tbl
+    for tbl, search_fn in (("old_fund", search_old_fund),
+                           ("new_fund", search_new_fund),
+                           ("land",     search_land),
+                           ("commerce", search_commerce)):
+        r = search_fn(code)
+        if r:
+            data, table = r, tbl
             break
-    conn.close()
-
     if not data:
         logger.warning(f"forward_object_post: object {code} not found in DB")
         return False
 
-    # 2) маппим колонки SQL → русские поля, ожидаемые build_caption()
-    if table == "old_fund":
-        data["Ориентир"]          = data.pop("orientir", None)
-        data["Комнаты"]           = data.pop("komnaty", None)
-        data["Площадь"]           = data.pop("ploshad", None)
-        data["Этаж"]              = data.pop("etazh", None)
-        data["Этажность"]         = data.pop("etazhnost", None)
-        data["Санузлы"]   = data.pop("sanuzly", None)
-        data["Состояние"]         = data.pop("sostoyanie", None)
-        data["Материал строения"] = data.pop("material", None)
-        data["Парковка"]          = data.pop("parkovka", None)
-        data["Дополнительно"]     = data.pop("dop_info", None)
-        data["Цена"]              = data.pop("price", None)
-    elif table == "new_fund":
-        data["Ориентир"]          = data.pop("orientir", None)
-        data["ЖК"]                = data.pop("jk", None)
-        data["Год постройки"]     = data.pop("year", None)
-        data["Комнаты"]           = data.pop("komnaty", None)
-        data["Площадь"]           = data.pop("ploshad", None)
-        data["Этаж"]              = data.pop("etazh", None)
-        data["Этажность"]         = data.pop("etazhnost", None)
-        data["Санузлы"]   = data.pop("sanuzly", None)
-        data["Состояние"]         = data.pop("sostoyanie", None)
-        data["Материал строения"] = data.pop("material", None)
-        data["Дополнительно"]     = data.pop("dop_info", None)
-        data["Цена"]              = data.pop("price", None)
-    elif table == "land":
-        data["Ориентир"]          = data.pop("orientir", None)
-        data["Тип недвижимости"]  = data.pop("type", None)
-        data["Год постройки"]     = data.pop("year", None)
-        data["Площадь участка"]   = data.pop("ploshad_uchastok", None)
-        data["Площадь дома"]      = data.pop("ploshad_dom", None)
-        data["Размер участка"]    = data.pop("razmer", None)
-        data["Этажность"]         = data.pop("etazhnost", None)
-        data["Санузлы"]   = data.pop("sanuzly", None)
-        data["Состояние"]         = data.pop("sostoyanie", None)
-        data["Материал строения"] = data.pop("material", None)
-        data["Заезд авто"]        = data.pop("zaezd", None)
-        data["Дополнительно"]     = data.pop("dop_info", None)
-        data["Цена"]              = data.pop("price", None)
-    else:  # commerce
-        data["Ориентир"]           = data.pop("orientir", None)
-        data["Целевое назначение"] = data.pop("nazna4enie", None)
-        data["Расположение"]       = data.pop("raspolozhenie", None)
-        data["Этаж"]               = data.pop("etazh", None)
-        data["Этажность"]          = data.pop("etazhnost", None)
-        data["Площадь помещения"]  = data.pop("ploshad_pom", None)
-        data["Площадь участка"]    = data.pop("ploshad_uchastok", None)
-        data["Учёт НДС"] = data.pop("nds", None)
-        data["Дополнительно"]      = data.pop("dop_info", None)
-        data["Цена"]               = data.pop("price", None)
+    data["ptype"]      = TABLE_PTYPE[table]
+    data["Тип заявки"] = data.get("order_type", "Продажа")
 
-    # 3) строим подпись и отфильтровываем лишние строки
-    bot_user    = await bot.get_me()
+    bot_user = await bot.get_me()
     full_caption = build_caption(data, bot_user.username)
-    caption_lines = [
+    caption = "\n".join(
         ln for ln in full_caption.splitlines()
         if "Оставить заявку" not in ln and "Больше объектов" not in ln
-    ]
-    caption = "\n".join(caption_lines)
+    )
 
-    # 4) безопасно собираем media_group (максимум 10 элементов)
-    photos = json.loads(data.get("photos", "[]") or "[]")
-    videos = json.loads(data.get("videos", "[]") or "[]")
-
-    media = _pack_media(photos, videos, caption)   # гарантирует лимит 10
-    if not media:                                  # вдруг нет ни одного file_id
+    photos = data.get("photos") or []
+    videos = data.get("videos") or []
+    media  = _pack_media(photos, videos, caption)
+    if not media:
         logger.warning(f"forward_object_post: no media for {code}")
         return False
 
-    # 5) шлём
     try:
         await bot.send_media_group(chat_id, media)
         return True
     except Exception as e:
         logger.error(f"forward_object_post send error: {e}")
         return False
+
 
 async def finish_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
@@ -2857,30 +2642,19 @@ async def post_init(application: Application) -> None:
 # ─── AUTO-REPOST JOB ──────────────────────────────────────────────
 async def auto_repost_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Каждые 3 суток перепостит все active-объявления, если с момента
-    последнего репоста прошло ≥ 3 дней.
-    • object_code сохраняется тем же.
-    • new_price=None → обычный «холодный» репост.
+    Каждые 3 суток репостит все active-объявления, если с момента репоста прошло ≥ 3 дней.
     """
-    bot     = context.bot
-    cutoff  = datetime.utcnow() - timedelta(days=3)
-    conn    = sqlite3.connect(DB_FILE)
-    cur     = conn.cursor()
-
-    for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(
-            f"SELECT object_code, COALESCE(repost_date, '') FROM {tbl} "
-            "WHERE status='active'"
-        )
-        for code, rdate in cur.fetchall():
+    bot    = context.bot
+    cutoff = (datetime.utcnow() - timedelta(days=3)).isoformat()
+    try:
+        for tbl, code, rdate in list_active_objects_for_repost(cutoff):
             try:
-                if not rdate or datetime.fromisoformat(rdate) < cutoff:
-                    # user_id = 0 → никому не шлём уведомлений
-                    await repost_object_in_channel(bot, str(code), None, user_id=0)
+                await repost_object_in_channel(bot, str(code), None, user_id=0)
             except Exception as e:
                 logger.warning("auto_repost %s failed: %s", code, e)
+    except Exception as e:
+        logger.error("auto_repost_job error: %s", e)
 
-    conn.close()
 
 def main():
     init_db()
@@ -3020,6 +2794,7 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
 
 
 
