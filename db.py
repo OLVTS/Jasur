@@ -1,16 +1,48 @@
-import sqlite3
+# db_pg.py
+# Полная версия под Postgres (psycopg2), без os.getenv.
+
 import json
 import re
-from typing import List, Dict, Any
 import datetime
+from typing import List, Dict, Any, Optional
 
-DB_FILE = "/data/realty.db"
+import psycopg2
+import psycopg2.extras
+
+
+# ────────────────────── подключение ──────────────────────
+
+_DATABASE_URL: Optional[str] = None
+
+def set_dsn(dsn: str) -> None:
+    """Задайте DSN перед любыми вызовами БД."""
+    global _DATABASE_URL
+    _DATABASE_URL = dsn
+
+def _connect():
+    if not _DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set. Call set_dsn(dsn) first.")
+    conn = psycopg2.connect(_DATABASE_URL, connect_timeout=10)
+    conn.autocommit = True
+    return conn
+
+def _cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+def _ph(n: int) -> str:
+    """n плейсхолдеров вида %s,%s,..."""
+    return ",".join(["%s"] * n)
+
+# ────────────────────── schema / init ─────────────────────
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
+    """
+    Создаём таблицы, добавляем недостающие колонки и функцию clean_num(text).
+    """
+    conn = _connect()
+    cur = _cursor(conn)
 
-    # ── создаём таблицы (теперь уже с updated_at) ─────────────
+    # таблицы
     cur.execute("""
     CREATE TABLE IF NOT EXISTS old_fund (
         object_code   TEXT PRIMARY KEY,
@@ -30,9 +62,10 @@ def init_db():
         photos        TEXT,
         videos        TEXT,
         status        TEXT DEFAULT 'active',
-        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at    TIMESTAMP                       -- ★ добавили
-    )""")
+        created_at    TIMESTAMPTZ DEFAULT now(),
+        updated_at    TIMESTAMPTZ
+    );
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS new_fund (
@@ -54,9 +87,10 @@ def init_db():
         photos        TEXT,
         videos        TEXT,
         status        TEXT DEFAULT 'active',
-        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at    TIMESTAMP                       -- ★
-    )""")
+        created_at    TIMESTAMPTZ DEFAULT now(),
+        updated_at    TIMESTAMPTZ
+    );
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS land (
@@ -73,15 +107,16 @@ def init_db():
         sanuzly           INTEGER,
         sostoyanie        TEXT,
         material          TEXT,
-        zaezd            TEXT,
+        zaezd             TEXT,
         dop_info          TEXT,
         price             TEXT,
         photos            TEXT,
         videos            TEXT,
         status            TEXT DEFAULT 'active',
-        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at        TIMESTAMP                    -- ★
-    )""")
+        created_at        TIMESTAMPTZ DEFAULT now(),
+        updated_at        TIMESTAMPTZ
+    );
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS commerce (
@@ -96,140 +131,112 @@ def init_db():
         ploshad_pom      TEXT,
         ploshad_uchastok TEXT,
         nds              TEXT,
+        owner            TEXT,
         dop_info         TEXT,
         price            TEXT,
         photos           TEXT,
         videos           TEXT,
         status           TEXT DEFAULT 'active',
-        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at       TIMESTAMP                     -- ★
-    )""")
+        created_at       TIMESTAMPTZ DEFAULT now(),
+        updated_at       TIMESTAMPTZ
+    );
+    """)
 
-    # Новая таблица для заявок по вторичке
     cur.execute("""
     CREATE TABLE IF NOT EXISTS client_secondary (
-        id             INTEGER PRIMARY KEY AUTOINCREMENT,
-        date           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        user_id        INTEGER,
+        id             BIGSERIAL PRIMARY KEY,
+        date           TIMESTAMPTZ DEFAULT now(),
+        user_id        BIGINT,
         phone          TEXT,
         username       TEXT,
         telegram_name  TEXT,
         client_name    TEXT,
         object_code    TEXT,
         realtor_code   TEXT
-    )""")
-
+    );
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS client_base (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        date          TEXT    NOT NULL,
-        user_id       INTEGER UNIQUE NOT NULL,
+        id            BIGSERIAL PRIMARY KEY,
+        date          TIMESTAMPTZ NOT NULL,
+        user_id       BIGINT UNIQUE NOT NULL,
         phone         TEXT,
         username      TEXT,
         telegram_name TEXT,
         client_name   TEXT
-    )
+    );
     """)
 
-    # ── для старых БД: пытаемся «добавить» колонку, если её нет ──
-    def _ensure_updated_at(table: str):
-        cur.execute(f"PRAGMA table_info({table})")
-        if "updated_at" not in [row[1] for row in cur.fetchall()]:
-            try:
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN updated_at TIMESTAMP")
-            except sqlite3.OperationalError:
-                pass  # колонку мог добавить другой поток
-
-
-        # дополнительные поля…
-        for tbl in ("old_fund", "new_fund", "land", "commerce"):
-            _ensure_column(tbl, "order_type",   "TEXT")
-            _ensure_column(tbl, "repost_date",  "TIMESTAMP")
-            _ensure_column(tbl, "message_ids",  "TEXT")
-            _ensure_column(tbl, "old_price",    "TEXT")
-            _ensure_column(tbl, "initial_price", "TEXT")
-            if tbl == "commerce":
-                _ensure_column(tbl, "nds", "TEXT")
-                _ensure_column(tbl, "owner", "TEXT")
-
-
-    def _ensure_column(table: str, col: str, ddl: str):
-        cur.execute(f"PRAGMA table_info({table})")
-        if col not in [r[1] for r in cur.fetchall()]:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
-
+    # добиваем дополнительные поля (если их нет)
     for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        _ensure_updated_at(tbl)
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS order_type   TEXT;")
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS repost_date  TIMESTAMPTZ;")
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS message_ids  TEXT;")
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS old_price    TEXT;")
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS initial_price TEXT;")
+    cur.execute("ALTER TABLE commerce ADD COLUMN IF NOT EXISTS owner TEXT;")
+    cur.execute("ALTER TABLE commerce ADD COLUMN IF NOT EXISTS nds   TEXT;")
 
-    _ensure_column("new_fund", "district", "TEXT")
+    # функция clean_num(text) → numeric (то же самое, что была в SQLite, только на SQL)
+    cur.execute("""
+    CREATE OR REPLACE FUNCTION clean_num(inp TEXT)
+    RETURNS NUMERIC AS $$
+      SELECT NULLIF(
+               regexp_replace(replace(inp, ',', '.'), '[^0-9\.]', '', 'g'),
+               ''
+             )::numeric;
+    $$ LANGUAGE SQL IMMUTABLE;
+    """)
 
-
-    conn.commit()
+    cur.close()
     conn.close()
 
 
-def _clean_num_py(val: str | None):
+# ────────────────────── утилиты ─────────────────────
 
-    try:
-        if val is None:
-            return None
-        s = str(val).replace(",", ".")           # 73,5 → 73.5
+def _json_dump(value) -> str:
+    return json.dumps(value or [], ensure_ascii=False)
 
-        cleaned = re.sub(r"[^\d.]", "", s)
+def _parse_json(text: Optional[str]):
+    return json.loads(text) if text else []
 
-        if not re.search(r"\d", cleaned):
-                return None
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
 
-        if cleaned.count(".") > 1:
-            parts = cleaned.split(".")
-            cleaned = parts[0] + "." + "".join(parts[1:])
+def _map_common_media(d: Dict[str, Any]) -> None:
+    d["photos"] = _parse_json(d.get("photos"))
+    d["videos"] = _parse_json(d.get("videos"))
 
-        if cleaned in ("", "."):
-            return None
-        return float(cleaned) if "." in cleaned else int(cleaned)
-    except Exception:
-        return None
+# ────────────────────── AUTO-ID ─────────────────────
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    conn.create_function("clean_num", 1, _clean_num_py)
-    return conn
-
-# ─────────────────── AUTO-ID ────────────────────
 def next_object_code() -> str:
     """
-    Возвращает следующий свободный номер объявления
-    (максимум по всем 4 таблицам + 1).
+    Следующий свободный код (максимум по всем таблицам + 1).
+    Считаем только те object_code, которые состоят из цифр.
     """
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-
+    conn = _connect(); cur = _cursor(conn)
     max_code = 0
     for tbl in ("old_fund", "new_fund", "land", "commerce"):
-        cur.execute(f"SELECT MAX(CAST(object_code AS INTEGER)) FROM {tbl}")
+        cur.execute(
+            f"SELECT MAX(object_code::int) AS mx "
+            f"FROM {tbl} WHERE object_code ~ '^[0-9]+$';"
+        )
         row = cur.fetchone()
-        if row and row[0]:
-            max_code = max(max_code, int(row[0]))
-
-    conn.close()
+        if row and row["mx"] is not None:
+            max_code = max(max_code, int(row["mx"]))
+    cur.close(); conn.close()
     return str(max_code + 1)
 
-# ─────── ФУНКЦИИ ДОБАВЛЕНИЯ ─────────────────────────
+# ────────────────────── INSERT/UPSERT ─────────────────────
+
 def insert_into_old_fund(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO old_fund (
-            object_code, realtor_code, orientir, district, komnaty,
-            ploshad, etazh, etazhnost, sanuzly, sostoyanie,
-            material, parkovka, dop_info, price, initial_price, photos, videos,
-            message_ids, status, order_type
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-    """, [
+    conn = _connect(); cur = _cursor(conn)
+    cols = ("object_code","realtor_code","orientir","district","komnaty",
+            "ploshad","etazh","etazhnost","sanuzly","sostoyanie",
+            "material","parkovka","dop_info","price","initial_price",
+            "photos","videos","message_ids","status","order_type")
+    vals = (
         data.get("object_code"),
         data.get("realtor_code"),
         data.get("Ориентир"),
@@ -245,28 +252,27 @@ def insert_into_old_fund(data: dict):
         data.get("Дополнительно"),
         data.get("Цена"),
         data.get("Цена"),
-        json.dumps(data.get("photos", [])),
-        json.dumps(data.get("videos", [])),
-        json.dumps(data.get("message_ids", [])),
+        _json_dump(data.get("photos")),
+        _json_dump(data.get("videos")),
+        _json_dump(data.get("message_ids")),
         "active",
         data.get("Тип заявки"),
-    ])
-    conn.commit()
-    conn.close()
+    )
+    updates = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols if c != "object_code"])
+    cur.execute(
+        f"INSERT INTO old_fund ({','.join(cols)}) VALUES ({_ph(len(cols))}) "
+        f"ON CONFLICT (object_code) DO UPDATE SET {updates};",
+        vals
+    )
+    cur.close(); conn.close()
 
 def insert_into_new_fund(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO new_fund (
-            object_code, realtor_code, orientir, district, jk, year,
-            komnaty, ploshad, etazh, etazhnost, sanuzly,
-            sostoyanie, material, dop_info, price, initial_price, photos, videos,
-            message_ids, status, order_type
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-    """, [
+    conn = _connect(); cur = _cursor(conn)
+    cols = ("object_code","realtor_code","orientir","district","jk","year",
+            "komnaty","ploshad","etazh","etazhnost","sanuzly",
+            "sostoyanie","material","dop_info","price","initial_price",
+            "photos","videos","message_ids","status","order_type")
+    vals = (
         data.get("object_code"),
         data.get("realtor_code"),
         data.get("Ориентир"),
@@ -283,28 +289,27 @@ def insert_into_new_fund(data: dict):
         data.get("Дополнительно"),
         data.get("Цена"),
         data.get("Цена"),
-        json.dumps(data.get("photos", [])),
-        json.dumps(data.get("videos", [])),
-        json.dumps(data.get("message_ids", [])),
+        _json_dump(data.get("photos")),
+        _json_dump(data.get("videos")),
+        _json_dump(data.get("message_ids")),
         "active",
         data.get("Тип заявки"),
-    ])
-    conn.commit()
-    conn.close()
+    )
+    updates = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols if c != "object_code"])
+    cur.execute(
+        f"INSERT INTO new_fund ({','.join(cols)}) VALUES ({_ph(len(cols))}) "
+        f"ON CONFLICT (object_code) DO UPDATE SET {updates};",
+        vals
+    )
+    cur.close(); conn.close()
 
 def insert_into_land(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO land (
-            object_code, realtor_code, orientir, district, type,
-            year, ploshad_uchastok, ploshad_dom, razmer, etazhnost,
-            sanuzly, sostoyanie, material, zaezd, dop_info,
-            price, initial_price, photos, videos, message_ids, status, order_type
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-    """, [
+    conn = _connect(); cur = _cursor(conn)
+    cols = ("object_code","realtor_code","orientir","district","type","year",
+            "ploshad_uchastok","ploshad_dom","razmer","etazhnost",
+            "sanuzly","sostoyanie","material","zaezd","dop_info",
+            "price","initial_price","photos","videos","message_ids","status","order_type")
+    vals = (
         data.get("object_code"),
         data.get("realtor_code"),
         data.get("Ориентир"),
@@ -322,34 +327,35 @@ def insert_into_land(data: dict):
         data.get("Дополнительно"),
         data.get("Цена"),
         data.get("Цена"),
-        json.dumps(data.get("photos", [])),
-        json.dumps(data.get("videos", [])),
-        json.dumps(data.get("message_ids", [])),
+        _json_dump(data.get("photos")),
+        _json_dump(data.get("videos")),
+        _json_dump(data.get("message_ids")),
         "active",
         data.get("Тип заявки"),
-    ])
-    conn.commit()
-    conn.close()
+    )
+    updates = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols if c != "object_code"])
+    cur.execute(
+        f"INSERT INTO land ({','.join(cols)}) VALUES ({_ph(len(cols))}) "
+        f"ON CONFLICT (object_code) DO UPDATE SET {updates};",
+        vals
+    )
+    cur.close(); conn.close()
 
 def insert_into_commerce(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO commerce (
-            object_code, realtor_code, orientir, district, nazna4enie,
-            raspolozhenie, etazh, etazhnost, ploshad_pom, ploshad_uchastok, nds, owner,
-            dop_info, price, initial_price, photos, videos, message_ids, status, order_type
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-    """, [
+    conn = _connect(); cur = _cursor(conn)
+    purpose = data.get("Целевое назначение")
+    if isinstance(purpose, list):
+        purpose = ", ".join(purpose)
+    cols = ("object_code","realtor_code","orientir","district","nazna4enie",
+            "raspolozhenie","etazh","etazhnost","ploshad_pom","ploshad_uchastok",
+            "nds","owner","dop_info","price","initial_price",
+            "photos","videos","message_ids","status","order_type")
+    vals = (
         data.get("object_code"),
         data.get("realtor_code"),
         data.get("Ориентир"),
         data.get("district"),
-        ", ".join(data.get("Целевое назначение", [])
-                  if isinstance(data.get("Целевое назначение"), list)
-                  else [data.get("Целевое назначение") or ""]),
+        purpose or "",
         data.get("Расположение"),
         data.get("Этаж"),
         data.get("Этажность"),
@@ -360,112 +366,152 @@ def insert_into_commerce(data: dict):
         data.get("Дополнительно"),
         data.get("Цена"),
         data.get("Цена"),
-        json.dumps(data.get("photos", [])),
-        json.dumps(data.get("videos", [])),
-        json.dumps(data.get("message_ids", [])),
+        _json_dump(data.get("photos")),
+        _json_dump(data.get("videos")),
+        _json_dump(data.get("message_ids")),
         "active",
         data.get("Тип заявки"),
-    ])
-    conn.commit()
-    conn.close()
+    )
+    updates = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols if c != "object_code"])
+    cur.execute(
+        f"INSERT INTO commerce ({','.join(cols)}) VALUES ({_ph(len(cols))}) "
+        f"ON CONFLICT (object_code) DO UPDATE SET {updates};",
+        vals
+    )
+    cur.close(); conn.close()
+
+# ────────────────────── UPDATE helpers ─────────────────────
 
 def update_price_old_fund(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE old_fund
-           SET price = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET price=%s, updated_at=now()
+         WHERE object_code=%s;
     """, (new_price, object_code))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
 def update_price_new_fund(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE new_fund
-           SET price = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET price=%s, updated_at=now()
+         WHERE object_code=%s;
     """, (new_price, object_code))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
 def update_price_land(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE land
-           SET price = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET price=%s, updated_at=now()
+         WHERE object_code=%s;
     """, (new_price, object_code))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
 def update_price_commerce(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE commerce
-           SET price = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET price=%s, updated_at=now()
+         WHERE object_code=%s;
     """, (new_price, object_code))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
 def mark_inactive_old_fund(object_code: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE old_fund
-           SET status = 'inactive', updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET status='inactive', updated_at=now()
+         WHERE object_code=%s;
     """, (object_code,))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
 def mark_inactive_new_fund(object_code: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE new_fund
-           SET status = 'inactive', updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET status='inactive', updated_at=now()
+         WHERE object_code=%s;
     """, (object_code,))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
 def mark_inactive_land(object_code: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE land
-           SET status = 'inactive', updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET status='inactive', updated_at=now()
+         WHERE object_code=%s;
     """, (object_code,))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
 def mark_inactive_commerce(object_code: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         UPDATE commerce
-           SET status = 'inactive', updated_at = CURRENT_TIMESTAMP
-         WHERE object_code = ?
+           SET status='inactive', updated_at=now()
+         WHERE object_code=%s;
     """, (object_code,))
-    conn.commit()
-    conn.close()
+    cur.close(); conn.close()
 
-def _clean_number(expr: str) -> str:
-    """Удаляет пробелы и валютные суффиксы."""
-    if not expr:
-        return ""
-    return re.sub(r"[^\d]", "", expr)
+def drop_price_old_fund(object_code: str, new_price: str):
+    conn = _connect(); cur = _cursor(conn)
+    cur.execute("""
+        UPDATE old_fund
+           SET old_price=price, price=%s, updated_at=now()
+         WHERE object_code=%s;
+    """, (new_price, object_code))
+    cur.close(); conn.close()
 
-# ─────────────────── СТАРЫЙ ФОНД ───────────────────
+def drop_price_new_fund(object_code: str, new_price: str):
+    conn = _connect(); cur = _cursor(conn)
+    cur.execute("""
+        UPDATE new_fund
+           SET old_price=price, price=%s, updated_at=now()
+         WHERE object_code=%s;
+    """, (new_price, object_code))
+    cur.close(); conn.close()
+
+def drop_price_land(object_code: str, new_price: str):
+    conn = _connect(); cur = _cursor(conn)
+    cur.execute("""
+        UPDATE land
+           SET old_price=price, price=%s, updated_at=now()
+         WHERE object_code=%s;
+    """, (new_price, object_code))
+    cur.close(); conn.close()
+
+def drop_price_commerce(object_code: str, new_price: str):
+    conn = _connect(); cur = _cursor(conn)
+    cur.execute("""
+        UPDATE commerce
+           SET old_price=price, price=%s, updated_at=now()
+         WHERE object_code=%s;
+    """, (new_price, object_code))
+    cur.close(); conn.close()
+
+# ────────────────────── SEARCH helpers ─────────────────────
+
+def _apply_in(sql: str, params: list, column: str, values: Optional[list]) -> str:
+    if values:
+        sql += f" AND {column} IN ({_ph(len(values))})"
+        params.extend(values)
+    return sql
+
+def _apply_range(sql: str, params: list, column: str, lo_key: str, hi_key: str, filters: dict) -> str:
+    lo, hi = filters.get(lo_key), filters.get(hi_key)
+    if lo is not None:
+        sql += f" AND clean_num({column}) >= %s"
+        params.append(lo)
+    if hi is not None:
+        sql += f" AND clean_num({column}) <= %s"
+        params.append(hi)
+    return sql
+
+# ────────────────────── SEARCH: старый фонд ─────────────────
+
 def search_old_fund(**filters) -> List[Dict[str, Any]]:
-    conn = _connect(); cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     sql = """
     SELECT object_code, realtor_code, orientir, district, komnaty, ploshad,
            etazh, etazhnost, sostoyanie, price, dop_info, photos, videos
@@ -473,55 +519,62 @@ def search_old_fund(**filters) -> List[Dict[str, Any]]:
     """
     params: list[Any] = []
 
-    # — фильтры (как раньше) —
-    if (regs := filters.get("region")):
-        sql += f" AND district IN ({','.join('?'*len(regs))})"; params += regs
-    if (conds := filters.get("condition")):
-        sql += f" AND sostoyanie IN ({','.join('?'*len(conds))})"; params += conds
-    if (rooms := filters.get("rooms")):
-        nums, four = [r for r in rooms if r != "4+"], "4+" in rooms
-        sub, subp = [], []
+    sql = _apply_in(sql, params, "district", filters.get("region"))
+    sql = _apply_in(sql, params, "sostoyanie", filters.get("condition"))
+
+    rooms = filters.get("rooms")
+    if rooms:
+        nums = [r for r in rooms if r != "4+"]
+        four = "4+" in rooms
+        subs, subp = [], []
         if nums:
-            sub.append(f"komnaty IN ({','.join('?'*len(nums))})")
-            subp += list(map(int, nums))
-        if four: sub.append("komnaty >= 4")
-        sql += " AND (" + " OR ".join(sub) + ")"; params += subp
+            subs.append(f"komnaty IN ({_ph(len(nums))})")
+            subp.extend(list(map(int, nums)))
+        if four:
+            subs.append("komnaty >= 4")
+        if subs:
+            sql += " AND (" + " OR ".join(subs) + ")"
+            params.extend(subp)
+
     for col, lo, hi in (
         ("ploshad","area_min","area_max"),
         ("etazh","floor_min","floor_max"),
         ("etazhnost","floors_total_min","floors_total_max"),
         ("price","price_min","price_max"),
     ):
-        a,b = filters.get(lo), filters.get(hi)
-        if a is not None: sql += f" AND clean_num({col})>=?"; params.append(a)
-        if b is not None: sql += f" AND clean_num({col})<=?"; params.append(b)
+        sql = _apply_range(sql, params, col, lo, hi, filters)
 
-    cur.execute(sql, params); rows = cur.fetchall(); conn.close()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
 
-    res = []
+    res: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        # ► маппинг ключей
-        map_ru = {
-            "orientir":"Ориентир", "komnaty":"Комнаты", "ploshad":"Площадь",
-            "etazh":"Этаж", "etazhnost":"Этажность",
-            "sostoyanie":"Состояние", "price":"Цена", "dop_info":"Дополнительно",
+        mapping = {
+            "orientir":"Ориентир",
+            "komnaty":"Комнаты",
+            "ploshad":"Площадь",
+            "etazh":"Этаж",
+            "etazhnost":"Этажность",
+            "sostoyanie":"Состояние",
+            "price":"Цена",
+            "dop_info":"Дополнительно",
         }
-        for db_key, ru_key in map_ru.items():
-            if d.get(db_key) is not None:
+        for db_key, ru_key in mapping.items():
+            if db_key in d and d[db_key] is not None:
                 d[ru_key] = d.pop(db_key)
         if "district" in d:
-            d["Район"] = d["district"]
-        d["photos"] = json.loads(d["photos"]) if d["photos"] else []
-        d["videos"] = json.loads(d["videos"]) if d["videos"] else []
-        d["ptype"]  = "Старыйфонд"
+            d["Район"] = d.pop("district")
+        _map_common_media(d)
+        d["ptype"] = "Старыйфонд"
         res.append(d)
     return res
 
+# ────────────────────── SEARCH: новый фонд ─────────────────
 
-# ─────────────────── НОВЫЙ ФОНД ───────────────────
 def search_new_fund(**filters) -> List[Dict[str, Any]]:
-    conn = _connect(); cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     sql = """
     SELECT object_code, realtor_code, orientir, district, jk, year,
            komnaty, ploshad, etazh, etazhnost, sostoyanie,
@@ -530,54 +583,62 @@ def search_new_fund(**filters) -> List[Dict[str, Any]]:
     """
     params: list[Any] = []
 
-    if (regs := filters.get("region")):
-        sql += f" AND district IN ({','.join('?'*len(regs))})"; params += regs
-    if (conds := filters.get("condition")):
-        sql += f" AND sostoyanie IN ({','.join('?'*len(conds))})"; params += conds
-    if (rooms := filters.get("rooms")):
-        nums, four = [r for r in rooms if r != "4+"], "4+" in rooms
-        sub, subp = [], []
+    sql = _apply_in(sql, params, "district", filters.get("region"))
+    sql = _apply_in(sql, params, "sostoyanie", filters.get("condition"))
+
+    rooms = filters.get("rooms")
+    if rooms:
+        nums = [r for r in rooms if r != "4+"]
+        four = "4+" in rooms
+        subs, subp = [], []
         if nums:
-            sub.append(f"komnaty IN ({','.join('?'*len(nums))})")
-            subp += list(map(int, nums))
-        if four: sub.append("komnaty >= 4")
-        sql += " AND (" + " OR ".join(sub) + ")"; params += subp
+            subs.append(f"komnaty IN ({_ph(len(nums))})")
+            subp.extend(list(map(int, nums)))
+        if four:
+            subs.append("komnaty >= 4")
+        if subs:
+            sql += " AND (" + " OR ".join(subs) + ")"
+            params.extend(subp)
+
     for col, lo, hi in (
         ("ploshad","area_min","area_max"),
         ("etazh","floor_min","floor_max"),
         ("etazhnost","floors_total_min","floors_total_max"),
         ("price","price_min","price_max"),
     ):
-        a,b = filters.get(lo), filters.get(hi)
-        if a is not None: sql += f" AND clean_num({col})>=?"; params.append(a)
-        if b is not None: sql += f" AND clean_num({col})<=?"; params.append(b)
+        sql = _apply_range(sql, params, col, lo, hi, filters)
 
-    cur.execute(sql, params); rows = cur.fetchall(); conn.close()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
 
-    res = []
+    res: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        map_ru = {
-            "orientir":"Ориентир", "komnaty":"Комнаты", "ploshad":"Площадь",
-            "etazh":"Этаж", "etazhnost":"Этажность",
-            "sostoyanie":"Состояние", "price":"Цена", "dop_info":"Дополнительно",
+        mapping = {
+            "orientir":"Ориентир",
+            "komnaty":"Комнаты",
+            "ploshad":"Площадь",
+            "etazh":"Этаж",
+            "etazhnost":"Этажность",
+            "sostoyanie":"Состояние",
+            "price":"Цена",
+            "dop_info":"Дополнительно",
         }
-        for k_ru,k_db in map_ru.items(): pass
-        for db_key, ru_key in map_ru.items():
-            if d.get(db_key) is not None:
+        for db_key, ru_key in mapping.items():
+            if db_key in d and d[db_key] is not None:
                 d[ru_key] = d.pop(db_key)
         if "district" in d:
-            d["Район"] = d["district"]
-        d["photos"] = json.loads(d["photos"]) if d["photos"] else []
-        d["videos"] = json.loads(d["videos"]) if d["videos"] else []
-        d["ptype"]  = "Новыйфонд"
+            d["Район"] = d.pop("district")
+        _map_common_media(d)
+        d["ptype"] = "Новыйфонд"
         res.append(d)
     return res
 
+# ────────────────────── SEARCH: участок ─────────────────
 
-# ─────────────────── УЧАСТОК ───────────────────
 def search_land(**filters) -> List[Dict[str, Any]]:
-    conn = _connect(); cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     sql = """
     SELECT object_code, realtor_code, orientir, district, type, year,
            ploshad_dom, ploshad_uchastok, razmer, etazhnost, sanuzly,
@@ -586,48 +647,48 @@ def search_land(**filters) -> List[Dict[str, Any]]:
     """
     params: list[Any] = []
 
-    if (regs := filters.get("region")):
-        sql += f" AND district IN ({','.join('?'*len(regs))})"; params += regs
-    if (types := filters.get("landtype")):
-        sql += f" AND type IN ({','.join('?'*len(types))})"; params += types
-    if (conds := filters.get("condition")):
-        sql += f" AND sostoyanie IN ({','.join('?'*len(conds))})"; params += conds
-    for col, lo, hi in (
-        ("ploshad_uchastok","area_min","area_max"),
-        ("price","price_min","price_max"),
-    ):
-        a,b = filters.get(lo), filters.get(hi)
-        if a is not None: sql += f" AND clean_num({col})>=?"; params.append(a)
-        if b is not None: sql += f" AND clean_num({col})<=?"; params.append(b)
+    sql = _apply_in(sql, params, "district",  filters.get("region"))
+    sql = _apply_in(sql, params, "type",      filters.get("landtype"))
+    sql = _apply_in(sql, params, "sostoyanie",filters.get("condition"))
 
-    cur.execute(sql, params); rows = cur.fetchall(); conn.close()
+    sql = _apply_range(sql, params, "ploshad_uchastok","area_min","area_max",filters)
+    sql = _apply_range(sql, params, "price","price_min","price_max",filters)
 
-    res = []
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    res: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        map_ru = {
-            "orientir":"Ориентир", "type":"Тип недвижимости",
-            "ploshad_dom":"Площадь дома", "ploshad_uchastok":"Площадь участка",
-            "razmer":"Размер участка", "etazhnost":"Этажность",
-            "sanuzly":"Санузлы", "sostoyanie":"Состояние",
-            "material":"Материал строения", "zaezd":"Заезд авто",
-            "price":"Цена", "dop_info":"Дополнительно",
+        mapping = {
+            "orientir":"Ориентир",
+            "type":"Тип недвижимости",
+            "ploshad_dom":"Площадь дома",
+            "ploshad_uchastok":"Площадь участка",
+            "razmer":"Размер участка",
+            "etazhnost":"Этажность",
+            "sanuzly":"Санузлы",
+            "sostoyanie":"Состояние",
+            "material":"Материал строения",
+            "zaezd":"Заезд авто",
+            "price":"Цена",
+            "dop_info":"Дополнительно",
         }
-        for db_key, ru_key in map_ru.items():
-            if d.get(db_key) is not None:
+        for db_key, ru_key in mapping.items():
+            if db_key in d and d[db_key] is not None:
                 d[ru_key] = d.pop(db_key)
         if "district" in d:
-            d["Район"] = d["district"]
-        d["photos"] = json.loads(d["photos"]) if d["photos"] else []
-        d["videos"] = json.loads(d["videos"]) if d["videos"] else []
-        d["ptype"]  = "Участок"
+            d["Район"] = d.pop("district")
+        _map_common_media(d)
+        d["ptype"] = "Участок"
         res.append(d)
     return res
 
+# ────────────────────── SEARCH: коммерция ────────────────
 
-# ─────────────────── КОММЕРЦИЯ ───────────────────
 def search_commerce(**filters) -> List[Dict[str, Any]]:
-    conn = _connect(); cur = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     sql = """
     SELECT object_code, realtor_code, orientir, district, nazna4enie, raspolozhenie,
            etazh, etazhnost, ploshad_pom, ploshad_uchastok, nds,
@@ -636,87 +697,40 @@ def search_commerce(**filters) -> List[Dict[str, Any]]:
     """
     params: list[Any] = []
 
-    if (regs := filters.get("region")):
-        sql += f" AND district IN ({','.join('?'*len(regs))})"; params += regs
-    if (purp := filters.get("purpose")):
-        sql += f" AND nazna4enie IN ({','.join('?'*len(purp))})"; params += purp
-    lo, hi = filters.get("price_min"), filters.get("price_max")
-    if lo is not None: sql += " AND clean_num(price)>=?"; params.append(lo)
-    if hi is not None: sql += " AND clean_num(price)<=?"; params.append(hi)
+    sql = _apply_in(sql, params, "district",  filters.get("region"))
+    sql = _apply_in(sql, params, "nazna4enie",filters.get("purpose"))
+    sql = _apply_range(sql, params, "price","price_min","price_max",filters)
 
-    cur.execute(sql, params); rows = cur.fetchall(); conn.close()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
 
-    res = []
-    map_ru = {
-        "orientir":"Ориентир", "nazna4enie":"Целевое назначение",
-        "raspolozhenie":"Расположение", "etazh":"Этаж", "etazhnost":"Этажность",
-        "ploshad_pom":"Площадь помещения", "ploshad_uchastok":"Площадь участка", "nds":"Учёт НДС",
-        "price":"Цена", "dop_info":"Дополнительно",
+    res: List[Dict[str, Any]] = []
+    mapping = {
+        "orientir":"Ориентир",
+        "nazna4enie":"Целевое назначение",
+        "raspolozhenie":"Расположение",
+        "etazh":"Этаж",
+        "etazhnost":"Этажность",
+        "ploshad_pom":"Площадь помещения",
+        "ploshad_uchastok":"Площадь участка",
+        "nds":"Учёт НДС",
+        "price":"Цена",
+        "dop_info":"Дополнительно",
     }
     for r in rows:
         d = dict(r)
-        for db_key, ru_key in map_ru.items():
-            if d.get(db_key) is not None:
+        for db_key, ru_key in mapping.items():
+            if db_key in d and d[db_key] is not None:
                 d[ru_key] = d.pop(db_key)
         if "district" in d:
-            d["Район"] = d["district"]
-        d["photos"] = json.loads(d["photos"]) if d["photos"] else []
-        d["videos"] = json.loads(d["videos"]) if d["videos"] else []
-        d["ptype"]  = "Коммерция"
+            d["Район"] = d.pop("district")
+        _map_common_media(d)
+        d["ptype"] = "Коммерция"
         res.append(d)
     return res
 
-def drop_price_old_fund(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        UPDATE old_fund
-           SET old_price    = price,
-               price        = ?,
-               updated_at   = CURRENT_TIMESTAMP
-         WHERE object_code = ?
-    """, (new_price, object_code))
-    conn.commit()
-    conn.close()
-
-def drop_price_new_fund(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        UPDATE new_fund
-           SET old_price    = price,
-               price        = ?,
-               updated_at   = CURRENT_TIMESTAMP
-         WHERE object_code = ?
-    """, (new_price, object_code))
-    conn.commit()
-    conn.close()
-
-def drop_price_land(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        UPDATE land
-           SET old_price    = price,
-               price        = ?,
-               updated_at   = CURRENT_TIMESTAMP
-         WHERE object_code = ?
-    """, (new_price, object_code))
-    conn.commit()
-    conn.close()
-
-def drop_price_commerce(object_code: str, new_price: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute("""
-        UPDATE commerce
-           SET old_price    = price,
-               price        = ?,
-               updated_at   = CURRENT_TIMESTAMP
-         WHERE object_code = ?
-    """, (new_price, object_code))
-    conn.commit()
-    conn.close()
+# ────────────────────── clients ───────────────────────────
 
 def insert_client_secondary(
     user_id: int,
@@ -727,49 +741,34 @@ def insert_client_secondary(
     object_code: str,
     realtor_code: str
 ):
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
+    conn = _connect(); cur = _cursor(conn)
     cur.execute("""
         INSERT INTO client_secondary (
             user_id, phone, username, telegram_name,
             client_name, object_code, realtor_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id, phone, username, telegram_name,
-        client_name, object_code, realtor_code
-    ))
-    conn.commit()
-    conn.close()
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s);
+    """, (user_id, phone, username, telegram_name, client_name, object_code, realtor_code))
+    cur.close(); conn.close()
 
-
-def get_last_client_secondary(user_id: int) -> tuple[str, str] | None:
-    """
-    Возвращает (client_name, phone) последней заявки secondary для данного user_id
-    или None, если нет.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT client_name, phone, object_code FROM client_secondary "
-        "WHERE user_id = ? ORDER BY date DESC LIMIT 1",
-        (user_id,)
-    )
+def get_last_client_secondary(user_id: int) -> Optional[tuple[str, str]]:
+    conn = _connect(); cur = _cursor(conn)
+    cur.execute("""
+        SELECT client_name, phone
+          FROM client_secondary
+         WHERE user_id=%s
+         ORDER BY date DESC
+         LIMIT 1;
+    """, (user_id,))
     row = cur.fetchone()
-    conn.close()
-    return (row[0], row[1]) if row else None
+    cur.close(); conn.close()
+    return (row["client_name"], row["phone"]) if row else None
 
-
-def get_client_base(user_id: int) -> sqlite3.Row | None:
-    """
-    Возвращает запись из client_base по user_id или None.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cur  = conn.cursor()
-    cur.execute("SELECT * FROM client_base WHERE user_id = ?", (user_id,))
+def get_client_base(user_id: int) -> Optional[Dict[str, Any]]:
+    conn = _connect(); cur = _cursor(conn)
+    cur.execute("SELECT * FROM client_base WHERE user_id=%s;", (user_id,))
     row = cur.fetchone()
-    conn.close()
-    return row
+    cur.close(); conn.close()
+    return dict(row) if row else None
 
 def upsert_client_base(
     user_id: int,
@@ -778,30 +777,25 @@ def upsert_client_base(
     telegram_name: str,
     client_name: str
 ):
-    """
-    Если пользователя ещё нет — вставляем, иначе обновляем phone+date.
-    """
-    now = datetime.datetime.utcnow().isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    cur  = conn.cursor()
-    # проверяем, есть ли уже запись
-    cur.execute("SELECT id FROM client_base WHERE user_id = ?", (user_id,))
-    if cur.fetchone():
-        cur.execute("""
-            UPDATE client_base
-               SET phone         = ?,
-                   username      = ?,
-                   telegram_name = ?,
-                   client_name   = ?,
-                   date          = ?
-             WHERE user_id = ?
-        """, (phone, username, telegram_name, client_name, now, user_id))
-    else:
-        cur.execute("""
-            INSERT INTO client_base
-                (date, user_id, phone, username, telegram_name, client_name)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (now, user_id, phone, username, telegram_name, client_name))
-    conn.commit()
+    now = _now_iso()
+    conn = _connect(); cur = _cursor(conn)
+    cur.execute("""
+        INSERT INTO client_base (date, user_id, phone, username, telegram_name, client_name)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            phone=EXCLUDED.phone,
+            username=EXCLUDED.username,
+            telegram_name=EXCLUDED.telegram_name,
+            client_name=EXCLUDED.client_name,
+            date=EXCLUDED.date;
+    """, (now, user_id, phone, username, telegram_name, client_name))
+    cur.close(); conn.close()
 
-    conn.close()
+
+# ────────────────────── misc ──────────────────────────────
+
+def _clean_number(expr: str) -> str:
+    """Удаляет всё, кроме цифр. (Может пригодиться снаружи.)"""
+    if not expr:
+        return ""
+    return re.sub(r"[^\d]", "", expr)
