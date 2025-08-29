@@ -2600,6 +2600,16 @@ async def auto_repost_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error("auto_repost_job error: %s", e)
 
+async def post_init(app: Application) -> None:
+    # прогреем getMe, а если есть refresh_file_ids — запустим
+    try:
+        await app.bot.get_me()
+    except Exception:
+        pass
+    try:
+        await refresh_file_ids(app.bot)
+    except Exception as e:
+        logger.warning("post_init: refresh_file_ids failed: %s", e)
 
 def main():
     init_db()
@@ -2739,6 +2749,7 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
 
 
 
