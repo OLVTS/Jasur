@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 from telegram.ext.filters import StatusUpdate
 from db import (
-    DB_FILE,
+    DB_FILE, set_dsn
     init_db,
     insert_into_old_fund,
     insert_into_new_fund,
@@ -45,6 +45,8 @@ from db import (
 import asyncio, json, logging, re, sqlite3
 
 from refresh import refresh_file_ids
+
+set_dsn("postgresql://postgres:SpeRJzpzhYDpNQyzXtbeqdjewtKXWBvC@postgres.railway.internal:5432/railway")
 
 MYADS_SHOW, MYADS_PRICE = range(4, 6)
 
@@ -3018,6 +3020,7 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
 
 
 
