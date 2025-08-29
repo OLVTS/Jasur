@@ -241,7 +241,7 @@ def init_db():
     CREATE OR REPLACE FUNCTION clean_num(inp TEXT)
     RETURNS NUMERIC AS $$
       SELECT NULLIF(
-               regexp_replace(replace(inp, ',', '.'), '[^0-9\.]', '', 'g'),
+               regexp_replace(replace(inp, ',', '.'), '[^0-9\\.]', '', 'g'),
                ''
              )::numeric;
     $$ LANGUAGE SQL IMMUTABLE;
@@ -1040,4 +1040,5 @@ def _clean_number(expr: str) -> str:
     if not expr:
         return ""
     return re.sub(r"[^\d]", "", expr)
+
 
