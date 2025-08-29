@@ -47,7 +47,7 @@ from db import (
     update_message_ids_and_repost_date,
     update_channel_message_and_repost_date,
     clear_old_price,
-    client_secondary_exists,
+    client_secondary_exists, list_employees, upsert_employee, delete_employee, get_employee_name,
 )
 import asyncio, json, logging, re
 
@@ -68,38 +68,24 @@ WORKSHEET_NAME  = "Телеграмм"
 STATUS_SHEET    = "Статус сотрудника BI"
 CRED_FILE       = "credentials.json"
 
-USERS_FILE = "users_id.txt"
 
 ADMIN_IDS  = {6864823290, 5498741148}
 
 ACCESS_MENU, ACCESS_OPEN_WAIT, ACCESS_CLOSE_PICK = range(3)
-def load_allowed() -> dict[int,str]:
-    """
-    Читает users_id.txt, где каждая строка: user_id:user_name
-    Возвращает словарь {id: name}.
-    """
-    users: dict[int,str] = {}
-    try:
-        with open(USERS_FILE, encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split(":", 1)
-                if not parts[0].isdigit():
-                    continue
-                uid = int(parts[0])
-                name = parts[1] if len(parts)>1 else ""
-                users[uid] = name
-    except FileNotFoundError:
-        pass
-    return users
+def load_allowed() -> dict[int, str]:
+    """Совместимая обёртка поверх БД."""
+    return list_employees()
 
-def save_allowed(users: dict[int,str]) -> None:
-    """
-    Записывает в users_id.txt строки вида:
-        12345678:Иван Иванов
-    """
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        for uid, name in users.items():
-            f.write(f"{uid}:{name}\n")
+def save_allowed(users: dict[int, str]) -> None:
+    """Совместимая обёртка: синхронизирует БД со словарём."""
+    existing = list_employees()
+    # удалить тех, кого нет в новом наборе
+    for uid in set(existing) - set(users):
+        delete_employee(uid)
+    # добавить/обновить остальных
+    for uid, name in users.items():
+        upsert_employee(uid, name or "")
+
 
 # ─── Новые состояния для ConversationHandler ────────────────────────
 NEWB_ASK_NAME, NEWB_ASK_PHONE = range(6, 8)
@@ -1295,15 +1281,7 @@ async def repost_object_in_channel(bot, code: str, new_price: Optional[str], use
 
 # ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────
 def load_allowed_ids() -> set[int]:
-    try:
-        with open(USERS_FILE, encoding="utf-8") as f:
-            return {
-                int(l.split(":",1)[0])
-                for l in f
-                if (s := l.strip()) and s.split(":",1)[0].isdigit()
-            }
-    except FileNotFoundError:
-        return set()
+    return set(list_employees().keys())
 
 
 def _format_price(digits: str) -> str:
@@ -2443,22 +2421,20 @@ async def finish_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         disable_web_page_preview=True,
         reply_markup=keyboard,
     )
-
+    
     realtor_id_str = str(data.get("realtor_code", "")).strip()
     realtor_display = ""
-
     try:
-        realtor_display = load_allowed().get(int(realtor_id_str), "")
+        rid = int(realtor_id_str)
+        realtor_display = get_employee_name(rid) or ""
     except ValueError:
-        pass                                    # realtor_id не является числом
-
+        pass
+    
     if realtor_display:
-        # если найдено «… @username» ─ берём @username, иначе оставляем ФИО
         m = re.search(r"@[\w\d_]+", realtor_display)
         if m:
             realtor_display = m.group(0)
     else:
-        # fallback: берём то, что сохранили при публикации, или сам ID
         realtor_display = data.get("realtor_uname", "") or realtor_id_str
 
     notify_text = (
@@ -2502,8 +2478,8 @@ async def access_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardRemove()
     )
 
-    users = load_allowed()         # dict[id,name]
-    # убираем админов
+    users = dict(list_employees())  # {id: name}
+    # не показываем админов
     for aid in ADMIN_IDS:
         users.pop(aid, None)
 
@@ -2524,43 +2500,30 @@ async def access_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ACCESS_CLOSE_PICK
 
+
 async def access_open_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     uid  = None
     name = None
 
-    # 1) Выбор через picker
     if msg.users_shared and getattr(msg.users_shared, "users", None):
-        shared = msg.users_shared.users[0]  # SharedUser
+        shared = msg.users_shared.users[0]
         uid    = shared.user_id
-
-        # пытаемся собрать имя из picker
         parts = []
-        if getattr(shared, "first_name", None):
-            parts.append(shared.first_name)
-        if getattr(shared, "last_name", None):
-            parts.append(shared.last_name)
-        if getattr(shared, "username", None):
-            parts.append("@" + shared.username)
+        if getattr(shared, "first_name", None): parts.append(shared.first_name)
+        if getattr(shared, "last_name", None): parts.append(shared.last_name)
+        if getattr(shared, "username", None): parts.append("@" + shared.username)
         name = " ".join(parts).strip()
-
-        # ─── если имени нет → просим переслать контакт ─────────────
         if not name:
-            await msg.reply_text(
-                "Не удалось получить имя из списка. "
-                "Пожалуйста, перешлите КОНТАКТ этого же пользователя."
-            )
+            await msg.reply_text("Не удалось получить имя. Перешлите контакт этого пользователя.")
             return ACCESS_OPEN_WAIT
-        # ────────────────────────────────────────────────────────────
 
-    # 2) Кнопка «поделиться контактом»
     elif msg.contact and msg.contact.user_id:
         uid  = msg.contact.user_id
         name = " ".join(filter(None, [msg.contact.first_name, msg.contact.last_name]))
         if msg.contact.username:
             name += f" (@{msg.contact.username})"
 
-    # 3) Пересланное сообщение
     elif getattr(msg, "forward_from", None):
         frm  = msg.forward_from
         uid  = frm.id
@@ -2568,7 +2531,6 @@ async def access_open_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if frm.username:
             name += f" (@{frm.username})"
 
-    # 4) Ответ на сообщение
     elif msg.reply_to_message:
         frm  = msg.reply_to_message.from_user
         uid  = frm.id
@@ -2577,22 +2539,16 @@ async def access_open_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name += f" (@{frm.username})"
 
     if uid is None:
-        return await msg.reply_text(
-            "Не удалось определить пользователя. Попробуйте ещё раз."
-        )
+        return await msg.reply_text("Не удалось определить пользователя. Попробуйте ещё раз.")
 
-    # ─── Сохраняем ID + имя в файл ─────────────────────────────────
-    users = load_allowed()      # теперь {id: name}
-    users[uid] = name or ""
-    save_allowed(users)
-    # ────────────────────────────────────────────────────────────────
+    # >>> ХРАНИМ В БД <<<
+    upsert_employee(uid, name or "")
 
     await msg.reply_text(
         f"✅ Доступ открыт для {name or uid}.",
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
-
 
 async def access_close_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2606,11 +2562,9 @@ async def access_close_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, _, uid_str = q.data.split(":")
     uid = int(uid_str)
 
-    users = load_allowed()
-    users.pop(uid, None)           # убираем этого пользователя
-    save_allowed(users)
+    delete_employee(uid)
 
-    # фильтруем админов
+    users = dict(list_employees())
     for aid in ADMIN_IDS:
         users.pop(aid, None)
 
@@ -2629,15 +2583,6 @@ async def access_close_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ACCESS_CLOSE_PICK
 
-
-async def post_init(application: Application) -> None:
-    """Вызывается сразу после initialize(); job_queue уже существует."""
-    application.job_queue.run_repeating(
-        refresh_file_ids,
-        interval=timedelta(days=7),      # каждые 7 дней
-        first=timedelta(seconds=30),     # первый запуск через 30 с
-        name="refresh_file_ids",
-    )
 
 # ─── AUTO-REPOST JOB ──────────────────────────────────────────────
 async def auto_repost_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2794,6 +2739,7 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
 
 
 
