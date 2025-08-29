@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 from telegram.ext.filters import StatusUpdate
 from db import (
-    DB_FILE, set_dsn
+    DB_FILE, set_dsn,
     init_db,
     insert_into_old_fund,
     insert_into_new_fund,
@@ -3020,6 +3020,7 @@ def main():
 # ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
+
 
 
 
