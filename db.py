@@ -4,7 +4,7 @@ import re
 from typing import List, Dict, Any
 import datetime
 
-DB_FILE = "realty.db"
+DB_FILE = "/data/realty.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -803,4 +803,5 @@ def upsert_client_base(
             VALUES (?, ?, ?, ?, ?, ?)
         """, (now, user_id, phone, username, telegram_name, client_name))
     conn.commit()
+
     conn.close()
