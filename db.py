@@ -29,6 +29,27 @@ def _connect():
 def _cursor(conn):
     return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
+def _execute(sql: str, params: tuple | list | None = None) -> None:
+    conn = _connect()
+    try:
+        cur = _cursor(conn)
+        cur.execute(sql, params or ())
+        cur.close()
+    finally:
+        conn.close()
+
+def _query(sql: str, params: tuple | list | None = None):
+    conn = _connect()
+    try:
+        cur = _cursor(conn)
+        cur.execute(sql, params or ())
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
 def _ph(n: int) -> str:
     """n плейсхолдеров вида %s,%s,..."""
     return ",".join(["%s"] * n)
@@ -1040,5 +1061,6 @@ def _clean_number(expr: str) -> str:
     if not expr:
         return ""
     return re.sub(r"[^\d]", "", expr)
+
 
 
