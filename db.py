@@ -33,6 +33,23 @@ def _ph(n: int) -> str:
     """n плейсхолдеров вида %s,%s,..."""
     return ",".join(["%s"] * n)
 
+def list_employees() -> dict[int, str]:
+    rows = _query("SELECT user_id, name FROM employees ORDER BY user_id")
+    return {int(r["user_id"]): (r["name"] or "") for r in rows}
+
+def get_employee_name(user_id: int) -> Optional[str]:
+    rows = _query("SELECT name FROM employees WHERE user_id = %s", (user_id,))
+    return (rows[0]["name"] if rows else None)
+
+def upsert_employee(user_id: int, name: str) -> None:
+    _execute("""
+        INSERT INTO employees (user_id, name)
+        VALUES (%s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name
+    """, (user_id, name or ""))
+
+def delete_employee(user_id: int) -> None:
+    _execute("DELETE FROM employees WHERE user_id = %s", (user_id,))
 
 # ────────────────────── schema / init ─────────────────────
 
@@ -42,6 +59,32 @@ def init_db():
     """
     conn = _connect()
     cur = _cursor(conn)
+
+# --- ACL: сотрудники с доступом ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS employees (
+      user_id    BIGINT PRIMARY KEY,
+      name       TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    """)
+    
+    # триггер для updated_at
+    cur.execute("""
+    CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $$
+    BEGIN
+      NEW.updated_at = now();
+      RETURN NEW;
+    END; $$ LANGUAGE plpgsql;
+    """)
+    cur.execute("DROP TRIGGER IF EXISTS trg_employees_updated_at ON employees;")
+    cur.execute("""
+    CREATE TRIGGER trg_employees_updated_at
+    BEFORE UPDATE ON employees
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    """)
+
 
     # таблицы
     cur.execute("""
@@ -997,3 +1040,4 @@ def _clean_number(expr: str) -> str:
     if not expr:
         return ""
     return re.sub(r"[^\d]", "", expr)
+
